@@ -1,5 +1,5 @@
 ---
-title: "Sanctifier FAQ and Troubleshooting Guide"
+title: "Sanctifier FAQ: Troubleshooting and Common Questions"
 sidebarTitle: "FAQ"
 description: "Answers to common questions about Sanctifier commands, configuration, false positives, CI integration, formal verification, and CVE identifiers."
 ---
@@ -360,7 +360,7 @@ This page collects the most frequently asked questions about Sanctifier, coverin
   </Accordion>
 
   <Accordion title="require_auth">
-    `Address::require_auth()` (and `require_auth_for_args`) is the Soroban host call that asserts the given address authorized the current invocation. Any state-mutating entry point that omits it allows unauthorized callers to act — the most critical class of Soroban vulnerability, detected as finding code `S001` and catalogued as `SOL-2024-001` through `SOL-2024-009`.
+    `Address::require_auth()` (and `require_auth_for_args`) is the Soroban host call that asserts the given address authorized the current invocation. Any state-mutating entry point that omits it allows unauthorized callers to act — the most critical class of Soroban vulnerability, detected as finding code `S001`. Representative database entries include `SOL-2024-001` (Unprotected Initialization, CVSS 9.8), `SOL-2024-002` (Missing Auth on Token Transfer, CVSS 9.8), `SOL-2024-006` (Unprotected Mint Function, CVSS 9.8), and `SOB-2024-018` (Upgrade Authorization Bypass, CVSS 9.9).
   </Accordion>
 
   <Accordion title="Kani">

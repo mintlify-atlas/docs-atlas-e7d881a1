@@ -1,5 +1,5 @@
 ---
-title: "Runtime Invariant Guards for Soroban Contracts"
+title: "Soroban Runtime Invariant Guards with sanctifier_guards"
 sidebarTitle: "Runtime Guards"
 description: "Use the sanctifier_guards crate and guard_invariant! macro to publish on-chain audit events and trap transactions when invariants are violated at runtime."
 ---
@@ -160,33 +160,46 @@ impl VaultContract {
 
 ### Step 3 — Pattern for pre/post state checks
 
-For more comprehensive invariant enforcement, wrap mutating logic in a helper that checks state both before and after the operation:
+For more comprehensive invariant enforcement, wrap mutating logic in a helper that checks state both before and after the operation. Define your own guard type and validation function, then call `guard_invariant!` with the appropriate conditions:
 
 ```rust
-use sanctifier_core::{Error as SanctifierError, SanctifiedGuard};
-use soroban_sdk::{Address, Env, Symbol};
+use sanctifier_guards::guard_invariant;
+use soroban_sdk::{symbol_short, Env};
 
-pub struct VaultRuntimeGuard {
-    pub total_shares: i128,
-    pub assets_under_management: i128,
+fn load_state(env: &Env) -> (i128, i128) {
+    let total_shares: i128 = env
+        .storage()
+        .instance()
+        .get(&symbol_short!("SHARES"))
+        .unwrap_or(0);
+    let aum: i128 = env
+        .storage()
+        .instance()
+        .get(&symbol_short!("AUM"))
+        .unwrap_or(0);
+    (total_shares, aum)
 }
 
-impl SanctifiedGuard for VaultRuntimeGuard {
-    fn check_invariant(&self, _env: &Env) -> Result<(), SanctifierError> {
-        if self.total_shares < 0 || self.assets_under_management < 0 {
-            return Err(SanctifierError::InvariantViolation(
-                "negative balances are not allowed".to_string(),
-            ));
-        }
+// Pre/post wrapper: enforce invariants around a mutating closure
+pub fn with_vault_guards<F>(env: &Env, f: F)
+where
+    F: FnOnce(),
+{
+    // Pre-condition: state must be consistent before the operation
+    let (shares_before, _aum_before) = load_state(env);
+    guard_invariant!(env, shares_before >= 0, VaultError::NegativeBalance);
 
-        if self.total_shares == 0 && self.assets_under_management != 0 {
-            return Err(SanctifierError::InvariantViolation(
-                "assets must be zero when total shares is zero".to_string(),
-            ));
-        }
+    f();
 
-        Ok(())
-    }
+    // Post-condition: state must still be consistent after the operation
+    let (shares_after, aum_after) = load_state(env);
+    guard_invariant!(env, shares_after >= 0, VaultError::NegativeBalance);
+    // When shares drop to zero, AUM must also be zero
+    guard_invariant!(
+        env,
+        shares_after != 0 || aum_after == 0,
+        VaultError::InsolventShares,
+    );
 }
 ```
 

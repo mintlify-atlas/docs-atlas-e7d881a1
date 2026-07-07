@@ -1,5 +1,5 @@
 ---
-title: "Install Sanctifier CLI and Dependencies"
+title: "Sanctifier CLI Installation: Cargo, Docker, and Z3 Setup"
 sidebarTitle: "Installation"
 description: "Install the Sanctifier CLI via Cargo or Docker, set up required dependencies, and configure optional formal-verification tools like Kani and Z3."
 ---
@@ -10,7 +10,7 @@ Sanctifier ships as a single Rust binary called `sanctifier`. The primary distri
 
 ### Rust toolchain
 
-Sanctifier is written in Rust and requires **Rust 1.75 or later**. Install the Rust toolchain via [rustup](https://rustup.rs/):
+Sanctifier is written in Rust and requires **Rust 1.78 or later**. Install the Rust toolchain via [rustup](https://rustup.rs/):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -69,7 +69,7 @@ xcode-select --install
     sanctifier --help
     ```
 
-    You should see the top-level help output listing all available subcommands (`analyze`, `verify`, `prove`, `baseline`, `diff`, `attest`, `cve`, and more).
+    You should see the top-level help output listing all available subcommands: `analyze`, `init`, `baseline`, `diff`, `watch`, `prove`, `verify`, `attest`, `badge`, `report`, `callgraph`, `cve`, and `update`.
 
     <Note>
       The `sanctifier-cli` crate links against the `z3` crate (Z3 solver bindings) via the `smt` feature on `sanctifier-core`. On some platforms the `z3` crate compiles Z3 from source as part of `cargo build`, which can take several minutes on first install. Subsequent builds use the cached artifacts.
@@ -179,7 +179,7 @@ cargo kani --version
 
 ## Environment variables
 
-For teams using `sanctifier deploy` or the runtime-guard deployment scripts, a handful of environment variables control network and deployment behavior. Copy the provided template to a local file that is excluded from version control:
+For teams using the runtime-guard deployment scripts, a handful of environment variables control network and deployment behavior. Copy the provided template to a local file that is excluded from version control:
 
 ```bash
 cp .env.example .env.local

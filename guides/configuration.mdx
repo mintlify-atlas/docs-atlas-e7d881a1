@@ -1,7 +1,7 @@
 ---
-title: "Configure Sanctifier with .sanctify.toml"
+title: "Configure Sanctifier Using the .sanctify.toml File"
 sidebarTitle: "Configuration"
-description: "Learn every .sanctify.toml key, how config discovery works, and how CLI flags override file settings for Sanctifier."
+description: "Learn every .sanctify.toml key, how config file discovery works by walking the directory tree, and how CLI flags override file settings."
 ---
 
 Sanctifier reads all of its analysis behaviour from a single TOML file named `.sanctify.toml`. You never point to it on the command line — instead, Sanctifier discovers it automatically by walking the directory tree upward from whatever path you are scanning. This page documents every supported key, the precedence rules, and how to validate that your file is working as intended.

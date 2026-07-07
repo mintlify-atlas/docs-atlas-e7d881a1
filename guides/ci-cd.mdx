@@ -1,7 +1,7 @@
 ---
-title: "Integrate Sanctifier into Your CI/CD Pipeline"
+title: "Integrate Sanctifier into Your GitHub Actions Pipeline"
 sidebarTitle: "CI/CD Integration"
-description: "Add Sanctifier security scans, Kani formal verification, and Soroban deployment automation to your GitHub Actions workflows."
+description: "Add Sanctifier security scans, Kani formal verification, and automated Soroban contract deployment to your GitHub Actions CI/CD workflows."
 ---
 
 Sanctifier ships with three ready-to-use GitHub Actions workflows that cover the full lifecycle of a Soroban contract: static analysis on every pull request, formal verification with Kani, and automated deployment of runtime guard wrapper contracts to the Soroban testnet. This page walks through each workflow, shows how to set up secrets, and covers diff tracking, baseline management, and JSON output processing.
@@ -66,7 +66,7 @@ Sanctifier ships with three ready-to-use GitHub Actions workflows that cover the
 
 ## Workflow 1 — Continuous Integration (`ci.yml`)
 
-The main CI workflow runs on every push and pull request to `main`. It gates the build on formatting, Clippy, tests, detector golden snapshots, and an SMT proof verification step.
+The main CI workflow runs on every push and pull request to `main`. It gates the build on formatting, Clippy, a debug build, the CLI reference freshness check, tests, detector golden snapshots, coverage, and an SMT proof verification step.
 
 ```yaml
 name: CI
@@ -120,26 +120,29 @@ jobs:
           cargo clippy -p sanctifier-core --all-targets --all-features -- -D warnings
           cd tooling/sanctifier-cli && cargo clippy --all-targets -- -D warnings
 
-      - name: Run All Tests
+      - name: Build All (Debug)
         run: |
-          cargo test -p sanctifier-core --all-features
-          cd tooling/sanctifier-cli && cargo test
-```
+          cargo build -p sanctifier-core --all-features
+          cd tooling/sanctifier-cli && cargo build
 
-The workflow also regenerates `docs/cli.md` from the Clap command definitions and fails if the committed copy has drifted:
-
-```yaml
       - name: CLI reference is up to date
         run: |
           cargo run -p sanctifier-cli --manifest-path tooling/sanctifier-cli/Cargo.toml \
             -- generate-docs > docs/cli.md
           git diff --exit-code -- docs/cli.md \
             || { echo "::error::docs/cli.md is stale. Run: cargo run -p sanctifier-cli -- generate-docs > docs/cli.md"; exit 1; }
-```
 
-And a final step runs an SMT invariant proof as part of every build:
+      - name: Run All Tests
+        run: |
+          cargo test -p sanctifier-core --all-features
+          cd tooling/sanctifier-cli && cargo test
 
-```yaml
+      - name: Detector golden snapshots (insta)
+        run: cargo insta test -p sanctifier-core --all-features --check --unreferenced reject
+
+      - name: Build Release CLI
+        run: cd tooling/sanctifier-cli && cargo build --release
+
       - name: Verify SMT proof — supply_conserved
         run: |
           cd tooling/sanctifier-cli
@@ -147,6 +150,8 @@ And a final step runs an SMT invariant proof as part of every build:
             --invariant supply_conserved \
             --no-save
 ```
+
+The `CLI reference is up to date` step regenerates `docs/cli.md` from the Clap command definitions and fails if the committed copy has drifted — keeping the CLI reference in sync automatically on every build. The `Detector golden snapshots` step uses `cargo-insta` to compare detector findings against reviewed snapshots, failing if any finding changes without a reviewed snapshot update.
 
 ### Running a basic scan step
 
@@ -437,7 +442,7 @@ jobs:
         with:
           payload: |
             {
-              "text": "Deployment ${{ github.event.workflow_run.conclusion }}: ${{ github.repository }}"
+              "text": "Deployment ${{ job.status }}: ${{ github.repository }}"
             }
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

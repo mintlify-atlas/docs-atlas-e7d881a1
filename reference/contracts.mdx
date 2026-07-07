@@ -1,5 +1,5 @@
 ---
-title: "Example Soroban Contracts and Security Templates"
+title: "Soroban Contract Templates and Security Code Examples"
 sidebarTitle: "Example Contracts"
 description: "Production-ready and intentionally vulnerable Soroban contract templates for learning security patterns, running detectors, and Kani formal verification."
 ---
@@ -74,7 +74,7 @@ A fully hardened Automated Market Maker (AMM) liquidity pool that implements the
 |-------|-------|------|
 | Unit tests | 4 | `cargo test` |
 | Property tests | 14 | `proptest` |
-| Formal verification harnesses | 6 | Kani |
+| Formal verification harnesses | 7 | Kani |
 
 ```rust
 pub fn swap(
@@ -287,7 +287,7 @@ A proof-of-concept crate demonstrating the **Core Logic Separation** pattern for
 
 **Key patterns demonstrated:**
 
-- `attempt_initialize(is_initialized: bool) -> Result<(), &'static str>` — pure function verified to reject double-initialization for all possible boolean inputs.
+- `initialize_pure(is_initialized: bool) -> Result<(), &'static str>` — pure function verified to reject double-initialization for all possible boolean inputs.
 - Shows how to structure a contract so the security-critical arithmetic is separated from the host-interaction layer, enabling Kani coverage without stubs.
 
 ```bash
@@ -310,8 +310,8 @@ An on-chain Groth16 zero-knowledge proof verifier built with [`ark-groth16`](htt
 - `wee_alloc` as a global allocator for lean WASM output.
 
 ```rust
-pub fn init(env: Env, verifying_key: Bytes)
-pub fn verify(env: Env, proof: Bytes, public_inputs: Bytes) -> bool
+pub fn init(env: Env, vk_bytes: Bytes)
+pub fn verify(env: Env, proof_bytes: Bytes, public_inputs_bytes: Bytes) -> bool
 ```
 
 <Info>

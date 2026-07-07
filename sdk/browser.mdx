@@ -1,5 +1,5 @@
 ---
-title: "Use @sanctifier/sdk in Browser Applications"
+title: "Using @sanctifier/sdk in the Browser for Soroban Analysis"
 sidebarTitle: "Browser"
 description: "Analyze Stellar Soroban contracts in the browser with @sanctifier/sdk — fetch the WASM bundle once with init(), then call analyze() from any JS context."
 ---
@@ -51,8 +51,7 @@ The browser entry guards every API function behind an `assertInitialized()` chec
 Calling `analyze()` before `init()` throws:
 
 ```
-Error: Sanctifier WASM is not initialized. Call `await init()` first
-or pass the wasm URL/bytes to init().
+Error: Sanctifier WASM is not initialized. Call `await init()` first or pass the wasm URL/bytes to init().
 ```
 
 Call `init()` once, as early as possible in your application bootstrap.

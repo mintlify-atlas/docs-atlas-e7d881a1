@@ -49,12 +49,16 @@ The `sanctifier-guards` crate provides a library of hook-based guards that you e
 
 ### Developer Workflow Integration
 
+- **Project setup** — `sanctifier init` scaffolds a `.sanctify.toml` configuration file with sensible defaults in any Soroban project directory.
 - **Watch mode** — `sanctifier watch` re-runs analysis automatically on every source file change, with debouncing.
 - **Baseline & diff** — snapshot findings with `sanctifier baseline`, then use `sanctifier diff` to compare against a git reference and surface only *new* regressions in pull requests.
-- **JSON output** — `--format json` produces machine-readable findings for CI pipelines.
+- **Call graph** — `sanctifier callgraph` generates a Graphviz DOT diagram of all cross-contract `env.invoke_contract` calls in a workspace.
+- **Security report** — `sanctifier report` produces a formatted security report, optionally written to a file with `--output`.
+- **JSON output** — `--format json` on `sanctifier analyze` produces machine-readable findings for CI pipelines.
 - **ZK attestations** — `sanctifier attest` generates a zero-knowledge proof that a scan passed a given score threshold, without revealing the full report.
 - **Security badges** — `sanctifier badge` creates an SVG badge and Markdown snippet from a JSON scan report.
 - **Vulnerability database** — `sanctifier cve` searches, lists, and exports the public Soroban/Stellar CVE database.
+- **Self-update** — `sanctifier update` checks for and downloads the latest Sanctifier binary.
 
 ## Components
 

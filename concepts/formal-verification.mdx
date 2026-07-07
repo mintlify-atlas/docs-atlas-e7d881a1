@@ -1,5 +1,5 @@
 ---
-title: "Formal Verification of Soroban Token Invariants"
+title: "Formal Verification for Soroban Contracts: SMT and Kani"
 sidebarTitle: "Formal Verification"
 description: "Prove Soroban contract invariants with Z3 SMT solving and Kani harnesses using Sanctifier's two-track formal verification pipeline."
 ---
@@ -261,8 +261,6 @@ mod verification {
 The `sanctify-macros` crate provides a proc-macro attribute that attaches an invariant expression to an `impl` block. In a normal build the attribute is **transparent** — the `impl` block is emitted unchanged. Under `cargo kani` (`--cfg kani`), the macro additionally emits a `#[kani::proof]` harness that asserts the invariant expression.
 
 ```rust
-use sanctify_macros::invariant;
-
 // In a normal build: the impl block passes through unchanged.
 // Under `--cfg kani`:  a #[kani::proof] harness is auto-generated.
 #[sanctify::invariant(total_supply == sum_of_balances())]

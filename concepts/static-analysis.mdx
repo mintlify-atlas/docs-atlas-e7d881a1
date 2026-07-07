@@ -1,5 +1,5 @@
 ---
-title: "Static Analysis for Soroban Smart Contracts"
+title: "Soroban Smart Contract Static Analysis with Sanctifier"
 sidebarTitle: "Static Analysis"
 description: "How Sanctifier parses Rust source with syn, walks the AST, and runs its built-in detector families to surface vulnerabilities before deployment."
 ---
@@ -189,6 +189,30 @@ Note that key re-use **across** storage types (`instance`, `persistent`, `tempor
 
 ---
 
+### S006 — Unsafe Patterns
+
+The `UnsafeVisitor` is a file-scope visitor (broader than S002) that walks every node in the entire parsed AST for `panic!` macros, `.unwrap()`, and `.expect()` method calls. Unlike S002, which is limited to `impl` blocks, S006 fires anywhere in the file including helper functions, trait impls, and module-level items.
+
+**Example triggers:**
+
+```rust
+// S006: panic! outside of an impl block
+fn helper() {
+    panic!("helper panicked");                // S006: file-scope panic
+}
+
+fn risky_helper() {
+    let x: Option<u32> = None;
+    let y = x.unwrap();                       // S006: file-scope unwrap
+}
+```
+
+Line numbers are derived from `proc-macro2` span locations. S006 and S002 can overlap when the same call site is inside an `impl` block — both codes will be emitted independently.
+
+**Fix:** Apply the same remediation as S002 — replace `unwrap()`/`expect()` with `?` or explicit `match`/`if let`, and replace `panic!` with `panic_with_error!` for typed contract errors.
+
+---
+
 ### S007 — Custom Rules
 
 Custom rules let you define project-specific lint patterns as regular expressions in your `.sanctify.toml` configuration.
@@ -281,7 +305,7 @@ Create a `.sanctify.toml` at the workspace root to control which detectors run a
 
 ```toml
 # .sanctify.toml
-ignore_paths = ["target", ".git", "tests"]
+ignore_paths = ["target", ".git"]
 ledger_limit = 64000
 approaching_threshold = 0.8
 strict_mode = false
