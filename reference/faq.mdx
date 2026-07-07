@@ -1,0 +1,393 @@
+---
+title: "Sanctifier FAQ and Troubleshooting Guide"
+sidebarTitle: "FAQ"
+description: "Answers to common questions about Sanctifier commands, configuration, false positives, CI integration, formal verification, and CVE identifiers."
+---
+
+This page collects the most frequently asked questions about Sanctifier, covering everything from first-run issues to advanced formal verification workflows. Questions are grouped by topic; a glossary of key terms appears at the bottom. If your question involves a specific CLI flag, the authoritative source is always `sanctifier <command> --help` or the [CLI Reference](/cli).
+
+## General
+
+<AccordionGroup>
+  <Accordion title="What is the difference between sanctifier analyze and sanctifier verify?">
+    They operate at different abstraction layers and serve complementary purposes.
+
+    **`sanctifier analyze`** performs *static analysis* — it parses your Rust source files and matches patterns against a library of known vulnerability signatures (the built-in CVE database plus any `[[custom_rules]]` in `.sanctify.toml`). It catches whole classes of bugs such as missing `require_auth`, unsafe arithmetic, unhandled `Result` values, and oversized ledger entries. It runs quickly and requires no special toolchain beyond a Rust installation.
+
+    **`sanctifier verify`** performs *formal invariant checking* — it scans for `#[sanctify::invariant(...)]` annotations across your codebase and attempts to prove or refute each one using the Z3 SMT solver. Pure-function invariants are dispatched directly to Z3; complex ones involving Soroban host types are reported as `KANI ↗` with a reminder to run `cargo kani`.
+
+    Run both for maximum coverage:
+
+    ```bash
+    sanctifier analyze .
+    sanctifier verify .
+    ```
+  </Accordion>
+
+  <Accordion title="Is Sanctifier a replacement for a professional audit?">
+    No. Sanctifier catches whole classes of mechanical mistakes early and cheaply — missing authorization checks, integer overflows, storage misuse — but it cannot reason about business logic, economic incentive attacks, or complex multi-contract trust relationships. Treat it as an always-on safety net that complements (not replaces) thorough testing, peer review, and professional audits.
+  </Accordion>
+
+  <Accordion title="Does Sanctifier modify my contracts?">
+    No. Sanctifier reads source files and writes only the artifacts you explicitly request — JSON reports, badge SVGs, DOT call graphs, and proof certificates. Your contract source is never altered. Adoption is fully reversible by removing the `.sanctify.toml` configuration file.
+  </Accordion>
+
+  <Accordion title="What are the SOB and SOL CVE ID prefixes?">
+    Sanctifier uses two ID schemes for its built-in vulnerability database:
+
+    - **`SOB-YYYY-NNN`** — Soroban-specific issues: DeFi math bugs, reentrancy patterns, flash loan vulnerabilities, oracle manipulation, and anything tightly coupled to the Soroban execution model.
+    - **`SOL-YYYY-NNN`** — Stellar/broader platform issues: authorization gaps on token operations, storage TTL problems, hardcoded admin keys, and initialization patterns that affect any Soroban contract.
+
+    The year reflects when the entry was catalogued; `NNN` is a zero-padded sequential number within that year. Examples: `SOL-2024-001` (Unprotected Initialization, CVSS 9.8) and `SOB-2024-015` (Cross-Contract Reentrancy, CVSS 8.8).
+  </Accordion>
+</AccordionGroup>
+
+## Installation and build
+
+<AccordionGroup>
+  <Accordion title="What Rust version does Sanctifier require?">
+    Sanctifier is tested against the current stable Rust toolchain. Install or update via [rustup](https://rustup.rs/):
+
+    ```bash
+    rustup update stable
+    cargo install --path tooling/sanctifier-cli
+    ```
+
+    The `verify` and `prove` commands additionally require the Z3 SMT solver C headers at build time. See the next question for details.
+  </Accordion>
+
+  <Accordion title="The build fails with 'z3.h file not found'. How do I fix it?">
+    The `verify` and `prove` commands depend on the Z3 Rust bindings (`z3-sys`), which need the Z3 C header at compile time.
+
+    **macOS (Homebrew):**
+    ```bash
+    brew install z3
+    export Z3_SYS_Z3_HEADER="$(brew --prefix z3)/include/z3.h"
+    ```
+
+    **Ubuntu / Debian:**
+    ```bash
+    sudo apt-get install -y libz3-dev
+    ```
+
+    Then rebuild:
+    ```bash
+    cargo install --path tooling/sanctifier-cli --force
+    ```
+
+    <Note>
+    The CLI links Z3 as a hard dependency, so the headers are required even if you only plan to run `analyze`. Only `verify` and `prove` invoke the solver at runtime.
+    </Note>
+  </Accordion>
+
+  <Accordion title="The build fails with a 'libdbus-1' or 'dbus-sys' error on Linux.">
+    A transitive dependency needs the D-Bus development headers. Install them with:
+
+    ```bash
+    sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+    ```
+
+    This is the same package the project's CI pipeline installs alongside `libz3-dev`.
+  </Accordion>
+
+  <Accordion title="'sanctifier: command not found' after cargo install.">
+    `cargo install` places binaries in `~/.cargo/bin`. Ensure that directory is on your `PATH`:
+
+    ```bash
+    export PATH="$HOME/.cargo/bin:$PATH"
+    ```
+
+    Add the line to your shell profile (`.bashrc`, `.zshrc`, etc.) to make it permanent.
+  </Accordion>
+</AccordionGroup>
+
+## Configuration
+
+<AccordionGroup>
+  <Accordion title="Why is my .sanctify.toml being ignored?">
+    Three common causes:
+
+    1. **TOML syntax error.** A malformed file is silently ignored and built-in defaults are used. The most frequent mistake is an unescaped backslash in a regex `pattern`. Write `"unsafe\\s*\\{"` (double-escaped) or use a TOML literal string `'unsafe\s*\{'`.
+
+    2. **A closer file shadows yours.** Sanctifier walks *up* from the scanned path and uses the first `.sanctify.toml` it finds. A config file nearer the target path silently wins.
+
+    3. **Wrong key expectation.** Some keys are reserved for future use. For example, `enabled_rules` currently records intent but does not gate individual detectors at runtime — the full detector set always runs. Use `[[custom_rules]]` to add or enforce specific patterns today.
+
+    Validate your TOML with `cat .sanctify.toml | python3 -c "import sys, tomllib; tomllib.load(sys.stdin.buffer)"` (Python 3.11+).
+  </Accordion>
+
+  <Accordion title="How do I suppress a false positive finding?">
+    Static analysis is deliberately conservative and will produce some false positives. Handle them in order of preference:
+
+    1. **Refactor to remove the ambiguity.** Replace `unwrap()` with explicit error handling, or `+` with `checked_add`. This improves both the finding and the contract's actual safety.
+
+    2. **Exclude the path.** Add the file or directory to `ignore_paths` in `.sanctify.toml` to skip generated code, fixtures, or vendored crates you do not own:
+
+    ```toml
+    ignore_paths = ["tests/fixtures", "vendor/"]
+    ```
+
+    3. **Use text mode as advisory.** `sanctifier analyze` in the default text mode exits `0` regardless of findings. Only JSON mode (`--format json`) gates CI on critical/high issues, so you can review findings without blocking development until the signal is clean.
+
+    If you believe a detector is systematically wrong, open an issue with a minimal reproduction — detectors are backed by golden `insta` snapshots, so regressions are tracked.
+  </Accordion>
+
+  <Accordion title="How do I add a project-specific detection rule?">
+    Add a `[[custom_rules]]` table to `.sanctify.toml` with a `name`, a `pattern` (Rust-compatible regex), and an optional `severity`:
+
+    ```toml
+    [[custom_rules]]
+    name    = "Forbidden unsafe block"
+    pattern = 'unsafe\s*\{'
+    severity = "error"
+
+    [[custom_rules]]
+    name    = "Direct string key in storage"
+    pattern = 'storage\(\)\.\w+\(\)\.set\(&"'
+    severity = "warning"
+    ```
+
+    Matches are reported as finding code `S007`. Use TOML literal strings (`'...'`) for patterns containing backslashes to avoid double-escaping.
+  </Accordion>
+</AccordionGroup>
+
+## Analysis and findings
+
+<AccordionGroup>
+  <Accordion title="How do I add Sanctifier to my CI pipeline?">
+    The minimum CI gate is a single step. In GitHub Actions:
+
+    ```yaml
+    - name: Sanctifier security scan
+      run: |
+        cargo install --path tooling/sanctifier-cli
+        sanctifier analyze . --format json
+    ```
+
+    `--format json` exits non-zero when there are **critical or high** findings, causing the CI job to fail. The default text mode is informational and always exits `0`.
+
+    For a full pipeline including formal verification:
+
+    ```yaml
+    - name: Install dependencies
+      run: sudo apt-get install -y libz3-dev libdbus-1-dev
+
+    - name: Install Sanctifier
+      run: cargo install --path tooling/sanctifier-cli
+
+    - name: Static analysis
+      run: sanctifier analyze . --format json
+
+    - name: Invariant verification (strict)
+      run: sanctifier verify . --strict
+    ```
+
+    `--strict` causes `verify` to exit non-zero if any invariant is **Refuted** or **Unknown**.
+  </Accordion>
+
+  <Accordion title="How do I generate a security badge for my README?">
+    Produce a JSON report, then pass it to `sanctifier badge`:
+
+    ```bash
+    # Step 1: generate the report
+    sanctifier analyze . --format json > sanctifier-report.json
+
+    # Step 2: generate the badge SVG and a markdown snippet
+    sanctifier badge \
+      --report sanctifier-report.json \
+      --svg-output sanctifier-security.svg \
+      --markdown-output badge.md \
+      --badge-url https://your-cdn.example.com/sanctifier-security.svg
+    ```
+
+    Commit `sanctifier-security.svg` and paste the markdown from `badge.md` into your `README.md`. The badge displays `Secure` (green), `Warning` (orange), or `Critical` (red) based on whether the report contains critical or high findings.
+  </Accordion>
+
+  <Accordion title="What does each S0xx finding code mean?">
+    Finding codes `S001`–`S016` each correspond to a detector family:
+
+    | Code | Detector |
+    |------|----------|
+    | S001 | Authorization gap (missing `require_auth`) |
+    | S002 | Explicit `panic!` |
+    | S003 | Unchecked arithmetic (`+`, `-`, `*` on integers) |
+    | S004 | Ledger entry size approaching or exceeding limit |
+    | S005 | Storage key collision |
+    | S006 | `unsafe` block |
+    | S007 | Custom rule match |
+    | S008 | Event inconsistency |
+    | S009 | Unhandled `Result` |
+    | S010 | Upgrade / admin mechanism risk |
+    | S011 | Invariant refuted by SMT solver |
+    | S012 | Hardcoded address literal |
+    | S013 | Missing edge-amount validation |
+    | S014 | (reserved) |
+    | S015 | Dead code |
+    | S016 | Error code collision in `#[contracterror]` |
+
+    See the [Finding Codes](/concepts/finding-codes) page for detailed descriptions and remediation guidance.
+  </Accordion>
+
+  <Accordion title="Why does analyze --format json fail my build but text mode does not?">
+    Text mode is designed to be informational — you can review findings without interrupting developer flow. JSON mode is designed for CI gating: it exits non-zero when the scan contains **critical** or **high** severity findings, so your pipeline fails before a vulnerable contract can be deployed.
+
+    If you have only medium or low findings, both modes exit `0`. Adjust `--limit` or `.sanctify.toml` thresholds to tune what counts as blocking.
+  </Accordion>
+</AccordionGroup>
+
+## Formal verification
+
+<AccordionGroup>
+  <Accordion title="What does PROVEN / REFUTED / UNKNOWN / KANI ↗ mean in verify output?">
+    `sanctifier verify` reports one of four statuses per invariant:
+
+    | Status | Meaning |
+    |--------|---------|
+    | **PROVEN** | The Z3 SMT solver confirmed the invariant holds for all possible inputs within the model. |
+    | **REFUTED** | Z3 found a concrete counterexample that violates the invariant. The output includes the values that trigger the failure. |
+    | **UNKNOWN** | Z3 could not prove or refute the invariant within its resource limits (timeout or solver limits). Investigate manually or increase Z3 resources. |
+    | **KANI ↗** | The invariant involves types (e.g. `Env`, `Address`) that the Z3 backend cannot model. Run `cargo kani` to verify it with Kani's deeper function-level model checker. |
+
+    In CI, use `--strict` to exit non-zero on `REFUTED` or `UNKNOWN`:
+
+    ```bash
+    sanctifier verify . --strict
+    ```
+  </Accordion>
+
+  <Accordion title="Why does sanctifier prove require --invariant?">
+    `sanctifier prove` runs SMT proofs for one or more *named* token invariants against a specific contract path. The `--invariant` flag selects which invariant(s) to prove:
+
+    ```bash
+    sanctifier prove --path contracts/token-invariants --invariant balance_non_negative
+    sanctifier prove --path contracts/token-invariants --invariant supply_conserved
+    sanctifier prove --path contracts/token-invariants --invariant no_unauthorized_mint
+    sanctifier prove --path contracts/token-invariants --invariant all
+    ```
+
+    The flag is required because proving all invariants at once (`all`) can be expensive, and you often want to target a specific property during development. Without the flag the command cannot determine which SMT model to construct.
+
+    Built-in invariant names:
+    - `balance_non_negative` — no account balance can go below zero
+    - `supply_conserved` — total supply is unchanged by transfers
+    - `no_unauthorized_mint` — tokens cannot be minted without proper `require_auth`
+    - `all` — run all three sequentially
+  </Accordion>
+
+  <Accordion title="How do I use a custom vulnerability database?">
+    Pass `--vuln-db` to `sanctifier analyze` with the path to your custom JSON file:
+
+    ```bash
+    sanctifier analyze ./contracts --vuln-db .sanctifier/custom-vulndb.json
+    ```
+
+    The custom file replaces (not extends) the embedded database, so start by exporting the built-in database and adding your own entries:
+
+    ```bash
+    sanctifier cve export --format json -o .sanctifier/custom-vulndb.json
+    # Then edit custom-vulndb.json to add entries
+    ```
+
+    Each entry must include at minimum: `id`, `name`, `description`, `severity`, `category`, `pattern`, and `recommendation`. The `pattern` field is a Rust-compatible regex applied to `.rs` source files. See the [CVE Database reference](/reference/vulnerability-database) for the full JSON schema.
+  </Accordion>
+
+  <Accordion title="My invariants are reported as 'Unsupported'. What is wrong?">
+    The CLI binary was built without the SMT backend enabled, or Z3 is not installed on the system. Install Z3 (see [Installation](#installation-and-build) above) and rebuild:
+
+    ```bash
+    sudo apt-get install -y libz3-dev   # or: brew install z3
+    cargo install --path tooling/sanctifier-cli --force
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Scoring and attestation
+
+<AccordionGroup>
+  <Accordion title="What does the Sanctity Score mean?">
+    The Sanctity Score is a 0–100 integer that summarises the security posture of a scanned contract. A clean scan (no findings) scores **100**. Each finding category deducts a weighted penalty:
+
+    | Severity | Penalty per finding |
+    |----------|---------------------|
+    | Critical | −40 |
+    | High | −15 |
+    | Medium | −6 |
+    | Low | −2 |
+
+    The score saturates at 0 (cannot go below zero). It is produced by `sanctifier attest` as part of a zero-knowledge attestation and is also embedded in the JSON report for use by the `badge` command. The score is bound to a SHA-256 commitment of the exact source bytes analyzed, so the attestation is tied to a specific version of the code.
+  </Accordion>
+
+  <Accordion title="How do I generate a ZK attestation that my scan passed a score threshold?">
+    Use `sanctifier attest`:
+
+    ```bash
+    sanctifier attest ./contracts --threshold 80
+    ```
+
+    This produces a proof that the contract scored ≥ 80 without revealing the raw finding counts. The attestation file can be shared publicly and verified by any third party who has the Sanctifier verifying key. See `sanctifier attest --help` for output path options.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Error → fix quick reference
+
+| Symptom / message | Likely cause | Fix |
+|-------------------|--------------|-----|
+| `fatal error: 'z3.h' file not found` | Z3 dev headers not on include path | Install Z3; on macOS set `Z3_SYS_Z3_HEADER` env var |
+| Build fails on `libdbus-1` / `dbus-sys` | D-Bus headers missing (Linux) | `sudo apt-get install -y libdbus-1-dev` |
+| `sanctifier: command not found` | `~/.cargo/bin` not on `PATH` | `export PATH="$HOME/.cargo/bin:$PATH"` |
+| Config edits have no effect | TOML parse error or shadowed by closer file | Fix TOML syntax; check for nearer `.sanctify.toml` |
+| Custom rule never fires | Unescaped backslash in `pattern` | Use TOML literal string `'...'` or double-escape `\\s` |
+| `analyze` reports issues but CI still passes | Text mode is advisory (exits 0) | Gate with `analyze --format json` |
+| Invariants reported as `Unsupported` | No Z3 / built without SMT backend | Install Z3 and rebuild |
+| `verify`/`prove` exits non-zero in CI | Invariant is Refuted or Unknown (with `--strict`) | Fix the invariant or investigate the counterexample |
+| `KANI ↗` status in verify output | Invariant uses host types Z3 cannot model | Run `cargo kani` for deeper model checking |
+| OOG (out of gas) on invocation | Oversized state / unbounded loops | Reduce state, use `Temporary` storage, bound iterations |
+| False positive auth gap | `require_auth` hidden behind indirection | Call `require_auth` directly in the entry point |
+
+---
+
+## Glossary
+
+<AccordionGroup>
+  <Accordion title="Soroban">
+    Stellar's smart-contract platform. Contracts are written in Rust, compiled to WebAssembly (`wasm32-unknown-unknown`), and executed deterministically by the Soroban host. Sanctifier is purpose-built for the Soroban execution model and its storage, authorization, and resource metering APIs.
+  </Accordion>
+
+  <Accordion title="SEP-41">
+    Stellar Ecosystem Proposal 41 — the standard interface for fungible tokens on Soroban, analogous to ERC-20 on Ethereum. It defines `transfer`, `transfer_from`, `approve`, `mint`, `burn`, `balance`, `allowance`, and metadata functions. The `contracts/sep41-token-invariants` contract is a reference implementation with Kani-verified proofs.
+  </Accordion>
+
+  <Accordion title="require_auth">
+    `Address::require_auth()` (and `require_auth_for_args`) is the Soroban host call that asserts the given address authorized the current invocation. Any state-mutating entry point that omits it allows unauthorized callers to act — the most critical class of Soroban vulnerability, detected as finding code `S001` and catalogued as `SOL-2024-001` through `SOL-2024-009`.
+  </Accordion>
+
+  <Accordion title="Kani">
+    A Rust model checker developed by AWS that performs exhaustive, bounded formal verification of Rust programs. Unlike unit tests (which sample inputs), Kani reasons over all possible inputs up to a configurable bound. Sanctifier reports complex invariants as `KANI ↗` when the Z3 backend cannot handle them, and the `contracts/reentrancy-guard` and `contracts/amm-pool` crates ship pre-written Kani harnesses. Requires a separate installation: see [kani.model-checking.github.io](https://model-checking.github.io/kani/).
+  </Accordion>
+
+  <Accordion title="SMT / Z3">
+    *Satisfiability Modulo Theories* — automated reasoning over arithmetic, logic, and data-type constraints. Z3 is the SMT solver Sanctifier links for `sanctifier verify` and `sanctifier prove`. Given a set of constraints derived from your invariant annotations and the contract's pure logic, Z3 either proves they are always satisfied (PROVEN) or finds a concrete counterexample (REFUTED). Requires the Z3 C library at build time (`libz3-dev` / `brew install z3`).
+  </Accordion>
+
+  <Accordion title="WASM">
+    *WebAssembly* — the bytecode format Soroban contracts compile to (`wasm32-unknown-unknown` target). Sanctifier performs **source-level** analysis of Rust files; it does not inspect compiled `.wasm` artifacts. Problems that only surface in the `wasm32` target (e.g. a `std`-dependent transitive dependency) are build issues outside Sanctifier's scope.
+  </Accordion>
+
+  <Accordion title="Sanctity Score">
+    A 0–100 integer summarising the security posture of a scanned contract. Starts at 100 and deducts weighted penalties per finding (−40 critical, −15 high, −6 medium, −2 low). Used by `sanctifier attest` to generate a zero-knowledge proof of threshold compliance and by `sanctifier badge` to determine the badge color (green/orange/red).
+  </Accordion>
+
+  <Accordion title="Baseline">
+    A snapshot of current findings saved to `.sanctify-baseline.json` by `sanctifier baseline`. On subsequent runs, `sanctifier analyze` compares new findings against the baseline and only reports net-new regressions — useful for gradually adopting Sanctifier in a codebase that already has known findings. Pass `--no-baseline` to ignore the baseline file and see the full finding list.
+  </Accordion>
+
+  <Accordion title="Attestation">
+    A zero-knowledge proof produced by `sanctifier attest` that binds a Sanctity Score to a SHA-256 commitment of the exact source bytes analyzed. An attestation can be shared publicly; any third party can verify the score claim without seeing the raw finding counts or source code. Useful for demonstrating security posture to auditors, partners, or token holders.
+  </Accordion>
+
+  <Accordion title="guard_invariant">
+    A Rust macro from the `sanctifier-guards` crate used in runtime contract instrumentation. When called around a boolean invariant expression, it publishes a structured `inv_fail` event to the Soroban event log if the invariant breaks, enabling off-chain indexers to detect violations across all instrumented contracts by subscribing to the single `inv_fail` topic. The `contracts/runtime-guard-wrapper` contract demonstrates three concrete usage sites.
+  </Accordion>
+</AccordionGroup>

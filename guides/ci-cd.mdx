@@ -1,0 +1,482 @@
+---
+title: "Integrate Sanctifier into Your CI/CD Pipeline"
+sidebarTitle: "CI/CD Integration"
+description: "Add Sanctifier security scans, Kani formal verification, and Soroban deployment automation to your GitHub Actions workflows."
+---
+
+Sanctifier ships with three ready-to-use GitHub Actions workflows that cover the full lifecycle of a Soroban contract: static analysis on every pull request, formal verification with Kani, and automated deployment of runtime guard wrapper contracts to the Soroban testnet. This page walks through each workflow, shows how to set up secrets, and covers diff tracking, baseline management, and JSON output processing.
+
+---
+
+## Setup flow
+
+<Steps>
+  <Step title="Install prerequisites locally">
+    Before configuring CI, verify you can run the tools locally. The setup script at `scripts/setup.sh` handles this interactively:
+
+    ```bash
+    bash scripts/setup.sh
+    ```
+
+    The script checks for and optionally installs Rust, the `wasm32-unknown-unknown` target, and the Soroban CLI. You can also install them directly:
+
+    ```bash
+    # Install Rust
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    source $HOME/.cargo/env
+
+    # Add the WebAssembly target
+    rustup target add wasm32-unknown-unknown
+
+    # Install Soroban CLI
+    cargo install --locked soroban-cli
+
+    # Verify
+    rustc --version && soroban --version
+    ```
+  </Step>
+
+  <Step title="Add your GitHub secret">
+    The deployment and validation workflows need a funded testnet account key. Add it once as a repository secret:
+
+    ```bash
+    # Using the GitHub CLI
+    gh secret set SOROBAN_SECRET_KEY --body "SBXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+
+    # Verify it was registered
+    gh secret list
+    ```
+
+    You can also add it through the GitHub web UI under **Settings → Secrets and variables → Actions → New repository secret**. The secret name must be exactly `SOROBAN_SECRET_KEY`.
+  </Step>
+
+  <Step title="Enable workflow permissions">
+    Some workflows write deployment status checks back to the repository. Ensure the correct permissions are set: **Settings → Actions → General → Workflow permissions → Read and write permissions**.
+  </Step>
+
+  <Step title="Configure branch protection (recommended)">
+    Under **Settings → Branches → Add rule** for `main`, enable:
+    - Require status checks to pass before merging
+    - Select: `Continuous Integration` (from `ci.yml`) and `Soroban Runtime Guard Deployment` (from `soroban-deploy.yml`)
+    - Require branches to be up to date before merging
+  </Step>
+</Steps>
+
+---
+
+## Workflow 1 — Continuous Integration (`ci.yml`)
+
+The main CI workflow runs on every push and pull request to `main`. It gates the build on formatting, Clippy, tests, detector golden snapshots, and an SMT proof verification step.
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: Continuous Integration
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry & build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libz3-dev libdbus-1-dev
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: |
+          cargo clippy -p sanctifier-core --all-targets --all-features -- -D warnings
+          cd tooling/sanctifier-cli && cargo clippy --all-targets -- -D warnings
+
+      - name: Run All Tests
+        run: |
+          cargo test -p sanctifier-core --all-features
+          cd tooling/sanctifier-cli && cargo test
+```
+
+The workflow also regenerates `docs/cli.md` from the Clap command definitions and fails if the committed copy has drifted:
+
+```yaml
+      - name: CLI reference is up to date
+        run: |
+          cargo run -p sanctifier-cli --manifest-path tooling/sanctifier-cli/Cargo.toml \
+            -- generate-docs > docs/cli.md
+          git diff --exit-code -- docs/cli.md \
+            || { echo "::error::docs/cli.md is stale. Run: cargo run -p sanctifier-cli -- generate-docs > docs/cli.md"; exit 1; }
+```
+
+And a final step runs an SMT invariant proof as part of every build:
+
+```yaml
+      - name: Verify SMT proof — supply_conserved
+        run: |
+          cd tooling/sanctifier-cli
+          ./target/release/sanctifier prove \
+            --invariant supply_conserved \
+            --no-save
+```
+
+### Running a basic scan step
+
+Add a `sanctifier analyze` step to any workflow that checks out your contract code:
+
+```yaml
+      - name: Build release CLI
+        run: cd tooling/sanctifier-cli && cargo build --release
+
+      - name: Sanctifier security scan
+        run: |
+          ./tooling/sanctifier-cli/target/release/sanctifier analyze . \
+            --format json | tee scan-results.json
+
+      - name: Fail on errors
+        run: |
+          jq -e '.findings | map(select(.severity == "error")) | length == 0' \
+            scan-results.json
+```
+
+### Diff tracking to block PRs with new findings
+
+Use `sanctifier diff` to compare findings against a baseline branch, then fail the PR if new findings are introduced:
+
+```bash
+sanctifier diff origin/main --fail-on-new
+```
+
+Integrate this as a pull-request check:
+
+```yaml
+      - name: Block PR on new security findings
+        if: github.event_name == 'pull_request'
+        run: |
+          ./tooling/sanctifier-cli/target/release/sanctifier diff origin/main \
+            --fail-on-new \
+            --format json | tee diff-results.json
+          jq '.new_findings' diff-results.json
+```
+
+### Baseline management
+
+Create or update the project baseline so that existing known findings are excluded from future diff checks:
+
+```bash
+# Create or overwrite the baseline with the current finding set
+sanctifier baseline
+
+# Use the baseline file in diff checks
+sanctifier diff origin/main --baseline .sanctifier-baseline.json --fail-on-new
+```
+
+### Processing JSON output with `jq`
+
+The `--format json` flag emits structured output that is easy to process in CI scripts:
+
+```bash
+# List all error-severity finding codes
+sanctifier analyze . --format json | jq '[.findings[] | select(.severity=="error") | .code]'
+
+# Count findings by severity
+sanctifier analyze . --format json | jq '.findings | group_by(.severity) | map({severity: .[0].severity, count: length})'
+
+# Extract custom-rule findings (S007)
+sanctifier analyze . --format json | jq '[.findings[] | select(.code=="S007")]'
+```
+
+---
+
+## Workflow 2 — Formal Verification with Kani (`fv-kani.yml`)
+
+The Kani workflow runs all `#[kani::proof]` harnesses across the proof-carrying crates on every push and pull request to `main`. It is currently **non-blocking** while the proof suite stabilizes — it reports results but does not fail the build.
+
+```yaml
+name: Formal Verification (Kani)
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  kani:
+    name: Kani proofs (non-blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HARNESS_TIMEOUT: 120s
+      KANI_PACKAGES: kani-poc-contract token-invariants amm-pool reentrancy-guard
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Kani toolchain & cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.kani/
+            target/
+          key: ${{ runner.os }}-kani-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Kani
+        continue-on-error: true
+        run: |
+          if ! command -v cargo-kani >/dev/null 2>&1; then
+            cargo install --locked kani-verifier
+          fi
+          cargo kani setup
+
+      - name: Run Kani harnesses (per-harness time budget)
+        id: kani
+        continue-on-error: true
+        run: |
+          overall=0
+          for pkg in $KANI_PACKAGES; do
+            echo "::group::cargo kani -p ${pkg}"
+            timeout 900 cargo kani \
+              -p "${pkg}" \
+              --harness-timeout "${HARNESS_TIMEOUT}" \
+              --output-format terse
+            rc=$?
+            echo "::endgroup::"
+            if [ "${rc}" -ne 0 ]; then
+              overall=1
+            fi
+          done
+          exit 0
+```
+
+The packages verified by this workflow are:
+
+| Package | What it proves |
+|---|---|
+| `kani-poc-contract` | Transfer conservation, mint/burn correctness, initialize idempotency |
+| `token-invariants` | Supply conservation invariant via `#[sanctify::invariant]` |
+| `amm-pool` | AMM arithmetic properties |
+| `reentrancy-guard` | Guard state machine correctness |
+
+<Tip>
+  To make Kani blocking once your harnesses are reliably green, remove the `continue-on-error: true` line from the "Run Kani harnesses" step and change `exit 0` at the end of the script to `exit $overall`.
+</Tip>
+
+---
+
+## Workflow 3 — Soroban deployment (`soroban-deploy.yml`)
+
+The deployment workflow builds the `runtime-guard-wrapper` contract to WASM, deploys it to the Soroban testnet, and runs continuous validation. It has three triggers:
+
+```yaml
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "contracts/runtime-guard-wrapper/**"
+      - "scripts/deploy-soroban-testnet.sh"
+      - ".github/workflows/soroban-deploy.yml"
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
+  workflow_dispatch:
+    inputs:
+      network:
+        description: "Target network"
+        required: true
+        default: "testnet"
+        type: choice
+        options:
+          - testnet
+          - futurenet
+          - mainnet
+      dry_run:
+        description: "Perform dry run"
+        required: false
+        type: boolean
+        default: false
+```
+
+The `build-and-deploy` job compiles the contract, validates the WASM artifact, and runs the deployment script:
+
+```yaml
+      - name: Build runtime guard wrapper contract
+        run: |
+          cargo build \
+            -p runtime-guard-wrapper \
+            --release \
+            --no-default-features \
+            --target wasm32-unknown-unknown
+
+      - name: Deploy to Soroban testnet
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          bash scripts/deploy-soroban-testnet.sh \
+            --network testnet \
+            --interval 300 \
+            --no-continuous \
+            --debug
+        env:
+          SOROBAN_SECRET_KEY: ${{ secrets.SOROBAN_SECRET_KEY }}
+        timeout-minutes: 30
+```
+
+After deployment, the `continuous-validation` job downloads the deployment manifest and invokes `health_check()` and `get_stats()` on every deployed contract:
+
+```yaml
+  continuous-validation:
+    name: Continuous Validation
+    runs-on: ubuntu-latest
+    needs: build-and-deploy
+    if: success() && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Run continuous validation checks
+        run: |
+          if [ -f "deployment-manifest.json" ]; then
+            CONTRACTS=$(jq -r '.deployments[].contract_id' deployment-manifest.json)
+
+            for CONTRACT_ID in $CONTRACTS; do
+              soroban contract invoke \
+                --id "$CONTRACT_ID" \
+                --network testnet \
+                -- health_check
+
+              soroban contract invoke \
+                --id "$CONTRACT_ID" \
+                --network testnet \
+                -- get_stats 2>/dev/null
+            done
+          fi
+        env:
+          SOROBAN_SECRET_KEY: ${{ secrets.SOROBAN_SECRET_KEY }}
+```
+
+### Triggering the workflow manually
+
+```bash
+# Trigger a full deployment
+gh workflow run soroban-deploy.yml \
+    -f network=testnet \
+    -f dry_run=false
+
+# Trigger a dry run
+gh workflow run soroban-deploy.yml \
+    -f network=testnet \
+    -f dry_run=true
+
+# View recent runs
+gh run list --workflow soroban-deploy.yml --limit 5
+```
+
+---
+
+## Webhook notifications
+
+Sanctifier's `analyze` command accepts a `--webhook-url` flag to POST scan results when a scan completes. This is useful for posting to a Slack incoming webhook or a custom endpoint:
+
+```bash
+sanctifier analyze . \
+    --format json \
+    --webhook-url "$SLACK_WEBHOOK_URL"
+```
+
+For GitHub Actions, you can also configure Slack notifications via the `workflow_run` trigger on the deployment workflow:
+
+```yaml
+name: Slack Notification
+
+on:
+  workflow_run:
+    workflows: ["Soroban Runtime Guard Deployment"]
+    types: [completed]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "Deployment ${{ github.event.workflow_run.conclusion }}: ${{ github.repository }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+```
+
+---
+
+## Badge generation
+
+Generate a README badge showing the latest scan status:
+
+```bash
+sanctifier badge
+```
+
+This command emits a Shields.io-compatible badge URL based on the most recent scan results. Add it to your `README.md`:
+
+```markdown
+![Sanctifier](https://img.shields.io/endpoint?url=https://your-badge-endpoint/sanctifier.json)
+```
+
+---
+
+## Monitoring and artifacts
+
+Every deployment run uploads two artifacts that are retained for 30 days:
+
+- **`deployment-manifest-<RUN_ID>`** — JSON file listing deployed contract IDs, WASM hashes, timestamps, and validation status.
+- **`deployment-log-<RUN_ID>`** — Full execution log for auditing.
+
+Download them from the GitHub Actions UI or with the CLI:
+
+```bash
+# View a run's artifacts
+gh run view <RUN_ID>
+
+# Download the manifest
+gh run download <RUN_ID> --name deployment-manifest-<RUN_ID>
+
+# Parse it locally
+cat deployment-manifest.json | jq '.deployments[] | {name, contract_id, status, last_validated}'
+```

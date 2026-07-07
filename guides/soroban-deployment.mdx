@@ -1,0 +1,410 @@
+---
+title: "Deploy Runtime Guard Contracts to Soroban Testnet"
+sidebarTitle: "Soroban Deployment"
+description: "Build and deploy the runtime-guard-wrapper contract to the Soroban testnet using the CLI, the deployment script, or GitHub Actions."
+---
+
+Sanctifier's `contracts/runtime-guard-wrapper` is a Soroban smart contract that wraps target contracts with pre- and post-execution validation, collects execution metrics, and exposes a `health_check()` entry point for continuous monitoring. This guide covers three ways to deploy it to the Soroban testnet: the `sanctifier deploy` CLI command, the `scripts/deploy-soroban-testnet.sh` shell script, and the `soroban-deploy.yml` GitHub Actions workflow.
+
+---
+
+## Prerequisites
+
+Before deploying, you need a funded testnet account and the toolchain installed:
+
+<CardGroup cols={2}>
+  <Card title="Rust + WASM target" icon="gear">
+    Rust 1.70 or later with the `wasm32-unknown-unknown` target added via `rustup target add wasm32-unknown-unknown`.
+  </Card>
+  <Card title="Soroban CLI" icon="terminal">
+    The latest Soroban CLI installed via `cargo install --locked soroban-cli`.
+  </Card>
+  <Card title="Funded testnet account" icon="wallet">
+    A keypair generated with `soroban keys generate` and funded via Friendbot.
+  </Card>
+  <Card title="jq + curl" icon="code">
+    Standard Unix utilities used by the deployment script for JSON parsing and API calls.
+  </Card>
+</CardGroup>
+
+### Generate and fund a testnet account
+
+```bash
+# Generate a keypair named test-deployer
+soroban keys generate --seed test-deployer --network testnet
+
+# Fund it via Friendbot
+ACCOUNT=$(soroban keys show test-deployer)
+curl "https://friendbot.stellar.org?addr=$ACCOUNT"
+
+# Verify the balance
+soroban account balance --account test-deployer --network testnet
+```
+
+### Environment variable
+
+All three deployment methods read credentials from the `SOROBAN_SECRET_KEY` environment variable. Set it in your shell or a local `.env.local` file (never commit this file):
+
+```bash
+# .env.local — excluded from version control
+export SOROBAN_SECRET_KEY="SBXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+export SOROBAN_NETWORK=testnet
+export SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
+
+# Load before running scripts
+source .env.local
+```
+
+---
+
+## Method 1 — CLI (`sanctifier deploy`)
+
+The `sanctifier deploy` command handles building, deploying, and optionally validating the contract in one step.
+
+<Steps>
+  <Step title="Build the CLI">
+    ```bash
+    cargo build -p sanctifier-cli --release
+    ```
+  </Step>
+
+  <Step title="Set your secret key">
+    ```bash
+    export SOROBAN_SECRET_KEY="SBXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    ```
+  </Step>
+
+  <Step title="Deploy with validation">
+    Pass the path to the contract directory, your target network, and `--validate` to invoke `health_check()` automatically after deployment:
+
+    ```bash
+    ./target/release/sanctifier deploy contracts/runtime-guard-wrapper \
+        --network testnet \
+        --secret-key "$SOROBAN_SECRET_KEY" \
+        --validate
+    ```
+
+    To deploy without the post-deployment validation step:
+
+    ```bash
+    ./target/release/sanctifier deploy contracts/runtime-guard-wrapper \
+        --network testnet \
+        --secret-key "$SOROBAN_SECRET_KEY"
+    ```
+
+    For machine-readable output:
+
+    ```bash
+    ./target/release/sanctifier deploy contracts/runtime-guard-wrapper \
+        --network testnet \
+        --secret-key "$SOROBAN_SECRET_KEY" \
+        --validate \
+        --output-format json
+    ```
+  </Step>
+
+  <Step title="Note the contract ID">
+    On success the CLI prints the deployed contract ID — a 56-character string beginning with `C`. Keep this ID for validation and monitoring.
+  </Step>
+</Steps>
+
+The `deploy` subcommand accepts the following options:
+
+| Option | Description |
+|---|---|
+| `--network <NETWORK>` | Target network: `testnet`, `futurenet`, or `mainnet` |
+| `--secret-key <KEY>` | Soroban secret key (S-prefixed) |
+| `--account-id <ID>` | Account ID (optional; derived from the secret key if omitted) |
+| `--validate` | Invoke `health_check()` on the deployed contract |
+| `--output-format` | Output format: `text` or `json` |
+
+---
+
+## Method 2 — Bash script (`scripts/deploy-soroban-testnet.sh`)
+
+The deployment script at `scripts/deploy-soroban-testnet.sh` automates the full lifecycle: environment validation, WASM build, deployment with retry logic, post-deployment validation, and an optional continuous validation loop that re-checks the contract every N seconds.
+
+### Standard deployment
+
+```bash
+source .env.local
+bash scripts/deploy-soroban-testnet.sh --network testnet
+```
+
+### Dry run (no actual deployment)
+
+```bash
+bash scripts/deploy-soroban-testnet.sh \
+    --network testnet \
+    --dry-run \
+    --debug
+```
+
+A dry run validates the environment and performs all build steps but replaces the actual `soroban contract deploy` call with a mock contract ID.
+
+### Deploy without continuous validation
+
+```bash
+bash scripts/deploy-soroban-testnet.sh \
+    --network testnet \
+    --no-continuous
+```
+
+### Custom validation interval
+
+```bash
+# Validate every 10 minutes instead of the default 5
+bash scripts/deploy-soroban-testnet.sh \
+    --network testnet \
+    --interval 600
+```
+
+### All flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--network <NETWORK>` | `testnet` | Target network (`testnet`, `futurenet`, `mainnet`) |
+| `--no-validate` | off | Skip post-deployment validation entirely |
+| `--no-continuous` | off | Disable the continuous validation loop |
+| `--dry-run` | off | Simulate without deploying |
+| `--interval <SECONDS>` | `300` | Validation interval in seconds |
+| `--debug` | off | Enable verbose debug logging |
+
+**Required environment variable:** `SOROBAN_SECRET_KEY`
+
+### What the script produces
+
+After a successful run the script writes two artifacts to the project root:
+
+**`deployment-manifest.json`** — JSON record of every deployed contract:
+
+```json
+{
+  "version": "1.0",
+  "deployments": [
+    {
+      "contract_id": "CXXXXX...",
+      "name": "runtime-guard-wrapper",
+      "wasm_hash": "abc123...",
+      "network": "testnet",
+      "deployed_at": "2026-02-25T12:34:56Z",
+      "last_validated": "2026-02-25T12:35:10Z",
+      "status": "active"
+    }
+  ],
+  "last_updated": "2026-02-25T12:35:10Z"
+}
+```
+
+**`deployment.log`** — Full execution log for auditing and troubleshooting.
+
+---
+
+## Method 3 — GitHub Actions (`soroban-deploy.yml`)
+
+The `.github/workflows/soroban-deploy.yml` workflow automates deployment on three triggers:
+
+| Trigger | Condition |
+|---|---|
+| Push to `main` | Only when files under `contracts/runtime-guard-wrapper/`, `scripts/deploy-soroban-testnet.sh`, or the workflow file itself change |
+| Schedule | Every 6 hours (`cron: "0 */6 * * *"`) for continuous validation |
+| Manual (`workflow_dispatch`) | Choose network and optionally enable dry run |
+
+### Setup
+
+Add the secret to your repository once:
+
+```bash
+gh secret set SOROBAN_SECRET_KEY --body "SBXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+```
+
+### Manual trigger
+
+```bash
+# Full deployment
+gh workflow run soroban-deploy.yml \
+    -f network=testnet \
+    -f dry_run=false
+
+# Dry run
+gh workflow run soroban-deploy.yml \
+    -f network=testnet \
+    -f dry_run=true
+```
+
+### Workflow jobs
+
+The workflow has three jobs that run in sequence:
+
+<Steps>
+  <Step title="build-and-deploy">
+    Checks out the repository, installs the stable Rust toolchain with `wasm32-unknown-unknown`, builds the contract in release mode, verifies the WASM artifact exists, and runs `scripts/deploy-soroban-testnet.sh`:
+
+    ```yaml
+    - name: Build runtime guard wrapper contract
+      run: |
+        cargo build \
+          -p runtime-guard-wrapper \
+          --release \
+          --no-default-features \
+          --target wasm32-unknown-unknown
+
+    - name: Deploy to Soroban testnet
+      run: |
+        bash scripts/deploy-soroban-testnet.sh \
+          --network testnet \
+          --interval 300 \
+          --no-continuous \
+          --debug
+      env:
+        SOROBAN_SECRET_KEY: ${{ secrets.SOROBAN_SECRET_KEY }}
+      timeout-minutes: 30
+    ```
+
+    Uploads `deployment-manifest.json` and `deployment.log` as workflow artifacts retained for 30 days.
+  </Step>
+
+  <Step title="continuous-validation">
+    Downloads the deployment manifest from the previous job, then invokes `health_check()` and `get_stats()` on each deployed contract ID:
+
+    ```yaml
+    - name: Run continuous validation checks
+      run: |
+        CONTRACTS=$(jq -r '.deployments[].contract_id' deployment-manifest.json)
+
+        for CONTRACT_ID in $CONTRACTS; do
+          soroban contract invoke \
+              --id "$CONTRACT_ID" \
+              --network testnet \
+              -- health_check
+
+          soroban contract invoke \
+              --id "$CONTRACT_ID" \
+              --network testnet \
+              -- get_stats 2>/dev/null
+        done
+      env:
+        SOROBAN_SECRET_KEY: ${{ secrets.SOROBAN_SECRET_KEY }}
+    ```
+  </Step>
+
+  <Step title="notification">
+    Creates a GitHub deployment status check and posts a summary to the workflow step summary, including the deployment status, network, timestamp, and commit SHA.
+  </Step>
+</Steps>
+
+---
+
+## Deployment orchestration steps
+
+Whether you use the CLI, the script, or GitHub Actions, the underlying deployment follows the same five phases:
+
+<Steps>
+  <Step title="Environment validation">
+    Checks that `cargo`, `soroban`, `jq`, and `curl` are on the `PATH`, verifies `SOROBAN_SECRET_KEY` is set, and confirms the network name is one of `testnet`, `futurenet`, or `mainnet`.
+  </Step>
+
+  <Step title="Contract build">
+    Compiles `contracts/runtime-guard-wrapper` to WASM using the release profile and the `wasm32-unknown-unknown` target:
+
+    ```bash
+    cargo build \
+        -p runtime-guard-wrapper \
+        --release \
+        --target wasm32-unknown-unknown
+    ```
+  </Step>
+
+  <Step title="WASM discovery and deployment">
+    Locates `target/wasm32-unknown-unknown/release/runtime_guard_wrapper.wasm` and submits it to the network via `soroban contract deploy`. Retries up to three times on transient failures.
+  </Step>
+
+  <Step title="Post-deployment validation">
+    Invokes `health_check()` on the newly deployed contract ID and records pass/fail in the deployment manifest:
+
+    ```bash
+    soroban contract invoke \
+        --id "$CONTRACT_ID" \
+        --network testnet \
+        -- health_check
+    ```
+  </Step>
+
+  <Step title="Continuous validation (optional)">
+    Enters a loop that calls `health_check()` and `get_stats()` every N seconds (default 300), updating the manifest status on each iteration. Pass `--no-continuous` or set `CONTINUOUS_VALIDATION=false` to skip.
+
+    ```bash
+    soroban contract invoke \
+        --id "$CONTRACT_ID" \
+        --network testnet \
+        -- get_stats
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Manual validation
+
+After any deployment, validate the contract directly with the Soroban CLI:
+
+```bash
+# Read the contract ID from the manifest
+CONTRACT_ID=$(jq -r '.deployments[0].contract_id' deployment-manifest.json)
+
+# Health check
+soroban contract invoke \
+    --id "$CONTRACT_ID" \
+    --network testnet \
+    -- health_check
+
+# Get execution stats (invariants_checked, call_count, guard_failures)
+soroban contract invoke \
+    --id "$CONTRACT_ID" \
+    --network testnet \
+    -- get_stats
+```
+
+---
+
+## Troubleshooting
+
+<Warning>
+  Never commit `.env.local` to version control. The file contains your Soroban secret key, which gives full control over the associated account.
+</Warning>
+
+**`SOROBAN_SECRET_KEY not found`** — Set the environment variable before running the script:
+
+```bash
+export SOROBAN_SECRET_KEY="SBXXXXXXXX..."
+# or
+source .env.local
+```
+
+**`wasm32-unknown-unknown target not found`** — Install the target:
+
+```bash
+rustup target add wasm32-unknown-unknown
+```
+
+**`soroban command not found`** — Install the CLI:
+
+```bash
+cargo install --locked soroban-cli
+```
+
+**`Insufficient balance`** — Fund the account on testnet via Friendbot:
+
+```bash
+ACCOUNT=$(soroban keys show test-deployer)
+curl "https://friendbot.stellar.org?addr=$ACCOUNT"
+```
+
+**`RPC connection failed`** — Check network connectivity and testnet status:
+
+```bash
+soroban network info --network testnet
+curl -s https://soroban-testnet.stellar.org/health
+```
+
+**Deployment succeeded but validation failed** — Wait a few seconds for the contract to finalize on the network, then retry the `health_check()` call manually.

@@ -1,0 +1,155 @@
+---
+title: "sanctifier prove — SMT-Based Formal Token Verification"
+sidebarTitle: "prove"
+description: "Run deep SMT-based formal verification on Soroban token contract invariants and save tamper-evident, machine-readable proof certificates to disk."
+---
+
+`sanctifier prove` performs SMT-based formal verification on a fixed catalog of Soroban token-contract invariants using Z3. Unlike `sanctifier verify`, which discovers and checks arbitrary `#[sanctify::invariant]` annotations, `prove` targets a well-known set of token-safety properties and saves a signed proof certificate for each one to disk. This makes it suitable for audits, compliance workflows, and CI gates where you need a durable, machine-readable record of what was proven.
+
+## Usage
+
+```bash
+sanctifier prove --invariant <INVARIANT> [OPTIONS]
+```
+
+## Arguments and options
+
+<ParamField query="--invariant" type="string" required>
+  The invariant to prove. Must be one of:
+
+  - `balance_non_negative` — every account balance is `>= 0`
+  - `supply_conserved` — the total token supply does not change across a
+    transfer (no tokens are minted or burned silently)
+  - `no_unauthorized_mint` — the `mint` entrypoint can only be reached by a
+    caller holding the admin authority
+  - `all` — run all three invariants in sequence
+
+</ParamField>
+
+<ParamField query="--path" type="string" default=".">
+  Path to the contract directory or single `.rs` file to verify. Sanctifier
+  canonicalizes the path before embedding it in the proof certificate.
+</ParamField>
+
+<ParamField query="--output-dir" type="string">
+  Directory to write proof certificates. Defaults to
+  `<path>/.sanctifier/proofs`. The directory is created if it does not exist.
+  Each invariant produces one file: `<invariant>.json`.
+</ParamField>
+
+<ParamField query="--no-save" type="boolean">
+  Skip writing proof certificates to disk. Results are still printed to stdout.
+  Useful in ephemeral CI environments where you only need the exit code.
+</ParamField>
+
+<ParamField query="--json" type="boolean">
+  Emit each proof result as a JSON object instead of the human-readable
+  colored output.
+</ParamField>
+
+## What each invariant proves
+
+### `balance_non_negative`
+
+Proves that the `balance` function can never return a negative `i128` value for any `Address` input. The Z3 model encodes the storage read as an unconstrained symbolic value and asserts that it satisfies `value >= 0`. A violation means the storage schema allows negative balances — typically caused by an unchecked subtraction.
+
+### `supply_conserved`
+
+Proves that a `transfer` from account A to account B leaves `balance(A) + balance(B)` unchanged. The model encodes the before/after states symbolically and checks that the sum is invariant. A violation indicates that the transfer function mints or destroys tokens silently.
+
+### `no_unauthorized_mint`
+
+Proves that any code path leading to the `mint` entrypoint is guarded by an `require_auth` check on the admin address. The SMT encoding traces the control flow and asserts that the auth guard is always present before any storage write that increases total supply.
+
+## Example commands
+
+Prove a single invariant and save the certificate:
+
+```bash
+sanctifier prove --invariant balance_non_negative --path ./contracts/token
+```
+
+Prove all invariants without saving (CI smoke check):
+
+```bash
+sanctifier prove --invariant all --no-save
+```
+
+Prove all invariants and write certificates to a custom directory:
+
+```bash
+sanctifier prove --invariant all \
+  --path ./contracts/token \
+  --output-dir ./audit/proofs
+```
+
+Emit JSON results for downstream tooling:
+
+```bash
+sanctifier prove --invariant supply_conserved --json
+```
+
+## Sample text output
+
+```
+✅ [PROVED] balance_non_negative
+   All reachable execution paths maintain balance >= 0.
+   Solved in 47ms
+   📄 Proof certificate saved → .sanctifier/proofs/balance_non_negative.json
+
+✅ [PROVED] supply_conserved
+   Transfer preserves the sum of sender and receiver balances.
+   Solved in 63ms
+   📄 Proof certificate saved → .sanctifier/proofs/supply_conserved.json
+
+❌ [VIOLATED] no_unauthorized_mint
+   Counterexample found.
+   Solved in 12ms
+
+   Counterexample:
+   Call: mint(env, recipient, amount)
+   Variables:
+     caller = Address("GABC...")
+     has_admin_auth = false
+```
+
+When any invariant is violated the command exits with code `1`.
+
+## Proof certificates
+
+Each saved certificate is a JSON file containing the proof result, the invariant name, the path to the analyzed contract, and a Unix timestamp:
+
+```json
+{
+  "invariant": "balance_non_negative",
+  "status": "Proved",
+  "message": "All reachable execution paths maintain balance >= 0.",
+  "counterexample": null,
+  "duration_ms": 47,
+  "contract_path": "/home/user/contracts/token",
+  "timestamp_secs": 1718000000
+}
+```
+
+Certificates are stored at `<path>/.sanctifier/proofs/<invariant>.json` by default. Commit the `.sanctifier/proofs/` directory to version control to make proof results auditable over time.
+
+<Note>
+  The proof certificate records what was proven at a point in time — it does
+  not re-execute the proof on read. Use `sanctifier prove` again after any
+  code change to regenerate the certificate.
+</Note>
+
+## When to use prove vs verify
+
+| Scenario | Recommended command |
+|---|---|
+| Proving standard token-safety properties with saved certificates | `sanctifier prove` |
+| Verifying custom `#[sanctify::invariant]` annotations | `sanctifier verify` |
+| CI gate that blocks on any invariant violation | Either with `--no-save` / `--strict` |
+| Audit deliverable with machine-readable proof artifacts | `sanctifier prove` |
+
+<Tip>
+  Run `sanctifier prove --invariant all --no-save` in CI as a fast smoke check.
+  Reserve `--output-dir` for release-gating and audit workflows where
+  certificates need to be archived.
+</Tip>

@@ -1,0 +1,630 @@
+---
+title: "Sanctifier Finding Codes Reference (S001–S016)"
+sidebarTitle: "Finding Codes"
+description: "Complete reference for all Sanctifier finding codes S001 through S016 plus SANCT_UNWRAP, with triggers, examples, and fixes for each."
+---
+
+Every finding that Sanctifier emits carries a stable code string. These codes appear in the coloured terminal output of `sanctifier analyze`, in the `findings[].code` field of JSON reports, and as keys in the `error_codes` summary object. Codes are defined in `sanctifier-core/src/finding_codes.rs` and are guaranteed unique by a compile-time test.
+
+The table below lists every code in the current registry. Click a row to expand the full trigger description, a vulnerable code example, and the recommended fix.
+
+---
+
+## Complete Code Table
+
+| Code | Category | Description |
+|---|---|---|
+| `S001` | `authentication` | Missing authentication guard in a state-mutating function |
+| `S002` | `panic_handling` | `panic!` / `unwrap` / `expect` usage that may cause runtime aborts |
+| `S003` | `arithmetic` | Unchecked arithmetic operation with overflow/underflow risk |
+| `S004` | `storage_limits` | Ledger entry size exceeds or approaches the configured threshold |
+| `S005` | `storage_keys` | Potential storage key collision across contract data paths |
+| `S006` | `unsafe_patterns` | Potentially unsafe language or runtime pattern detected |
+| `S007` | `custom_rule` | User-defined regex rule matched contract source |
+| `S008` | `events` | Inconsistent topic counts or sub-optimal gas patterns in events |
+| `S009` | `logic` | A function call returns a `Result` that is not consumed or handled |
+| `S010` | `upgrades` | Potential security risk in contract upgrade or admin mechanisms |
+| `S011` | `formal_verification` | Z3 formally proved a mathematical violation of an invariant |
+| `S012` | `code_hygiene` | Hardcoded admin address or secret literal in an authentication context |
+| `S013` | `code_hygiene` | Transfer/mint/burn missing `amount > 0` or `from != to` validation |
+| `S014` | `code_hygiene` | Deprecated soroban-sdk host function with a suggested replacement |
+| `S015` | `code_hygiene` | Dead code or always-true guard condition via constant folding |
+| `S016` | `code_hygiene` | Inconsistent or duplicate discriminants in `#[contracterror]` enum |
+| `S017` | `arithmetic` | Fee/interest calculation rounds to zero for micro-amounts (fee-evasion risk) |
+| `SANCT_UNWRAP` | `panic_handling` | `unwrap` / `expect` / risky `unwrap_or_default` inside `#[contractimpl]` entrypoints |
+| `SANCT_ARG_DOS` | `denial_of_service` | Entrypoint iterates over a `Vec` or `Map` argument without a visible length cap |
+
+---
+
+## Per-Code Details
+
+<Accordion title="S001 — Missing require_auth (authentication)">
+
+**What triggers it**
+
+The `scan_auth_gaps` visitor finds every `pub fn` in an `impl` block that calls `.set()`, `.update()`, or `.remove()` on a storage handle but never calls `require_auth` or `require_auth_for_args` anywhere in the same function body. The heuristic inspects receiver-chain tokens for `"storage"`, `"persistent"`, `"temporary"`, and `"instance"`.
+
+**Vulnerable code**
+
+```rust
+#[contractimpl]
+impl MyContract {
+    // S001: writes to storage, never calls require_auth
+    pub fn set_data(env: Env, val: u32) {
+        env.storage().instance().set(&DataKey::Val, &val);
+    }
+}
+```
+
+**Fixed code**
+
+```rust
+#[contractimpl]
+impl MyContract {
+    pub fn set_data(env: Env, val: u32) {
+        env.require_auth();                               // ← auth guard
+        env.storage().instance().set(&DataKey::Val, &val);
+    }
+}
+```
+
+Add `env.require_auth()` (or `addr.require_auth()`) as the first statement of any public function that mutates state.
+
+</Accordion>
+
+<Accordion title="S002 — Panic / Unwrap / Expect (panic_handling)">
+
+**What triggers it**
+
+The `scan_panics` visitor walks all `impl` functions and flags:
+- `panic!(...)` macro invocations
+- `.unwrap()` method calls
+- `.expect(...)` method calls
+
+A separate `SANCT_UNWRAP` code (see below) is emitted for the same patterns specifically inside `#[contractimpl]` entrypoints.
+
+**Vulnerable code**
+
+```rust
+pub fn unsafe_fn(env: Env) {
+    panic!("Something went wrong");       // S002
+}
+
+pub fn unsafe_unwrap(env: Env) {
+    let x: Option<u32> = None;
+    let y = x.unwrap();                   // S002
+}
+
+pub fn unsafe_expect(env: Env) {
+    let x: Option<u32> = None;
+    let y = x.expect("Failed to get x"); // S002
+}
+```
+
+**Fixed code**
+
+```rust
+pub fn safe_balance(env: Env, id: Address) -> Result<i128, Error> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Balance(id))
+        .ok_or(Error::NotFound)           // typed error instead of panic
+}
+```
+
+Return `Result` and propagate errors with `?`. Reserve `unwrap()` and `expect()` for tests.
+
+</Accordion>
+
+<Accordion title="S003 — Arithmetic Overflow (arithmetic)">
+
+**What triggers it**
+
+The `ArithVisitor` finds bare `+`, `-`, `*`, `+=`, `-=`, and `*=` operators inside contract `impl` functions. One finding is emitted per `(function_name, operator)` pair — multiple uses of the same operator in one function produce a single diagnostic.
+
+**Vulnerable code**
+
+```rust
+pub fn add_balances(env: Env, a: u64, b: u64) -> u64 {
+    a + b              // S003: unchecked addition
+}
+
+pub fn accumulate(env: Env, mut balance: u64, amount: u64) -> u64 {
+    balance += amount; // S003: unchecked compound assignment
+    balance
+}
+```
+
+**Fixed code**
+
+```rust
+pub fn add_safe(env: Env, a: u64, b: u64) -> Result<u64, Error> {
+    a.checked_add(b).ok_or(Error::Overflow)
+}
+
+pub fn accumulate_safe(env: Env, balance: u64, amount: u64) -> Result<u64, Error> {
+    balance.checked_add(amount).ok_or(Error::Overflow)
+}
+```
+
+Use `checked_add`, `checked_sub`, `checked_mul` and propagate `None` as a typed error.
+
+</Accordion>
+
+<Accordion title="S004 — Ledger Entry Size Risk (storage_limits)">
+
+**What triggers it**
+
+The `analyze_ledger_size` scanner walks every `#[contracttype]` struct and enum, estimates the serialized size of each field using conservative type-size heuristics, and emits `ApproachingLimit` when the total exceeds `ledger_limit × approaching_threshold` (default 80% of 64,000 bytes) or `ExceedsLimit` when it meets or exceeds `ledger_limit`.
+
+**Vulnerable code**
+
+```rust
+#[contracttype]
+pub struct HugeState {
+    pub buffer_a: Bytes,  // 64 bytes
+    pub buffer_b: Bytes,  // 64 bytes
+    pub data: Vec<u128>,  // 8 + 16 = 24 bytes (undercount for large vecs)
+    // estimated total approaches 64 KB warning threshold at scale
+}
+```
+
+**Fixed code**
+
+Decompose large data structures into separate ledger entries with distinct keys rather than a single monolithic struct. Store only indexes or hashes inline and retrieve associated data separately.
+
+</Accordion>
+
+<Accordion title="S005 — Storage Key Collision (storage_keys)">
+
+**What triggers it**
+
+The `StorageVisitor` tracks every storage key — string literals, `Symbol::new` calls, `symbol_short!` macros, and named constants — grouped by storage type. After the full file walk, `final_check()` emits a collision for each key that appears in the same storage tier (`instance`, `persistent`, or `temporary`) more than once.
+
+**Vulnerable code**
+
+```rust
+#[contractimpl]
+impl MyContract {
+    pub fn write_a(env: Env) {
+        // S005: "USER" used twice in persistent storage
+        env.storage().persistent().set(&"USER", &1u32);
+    }
+
+    pub fn write_b(env: Env) {
+        // S005: same key, same tier — collision
+        env.storage().persistent().set(&"USER", &2u32);
+    }
+}
+```
+
+**Fixed code**
+
+Use a `#[contracttype]` enum as the key type so each variant is distinct at the type level:
+
+```rust
+#[contracttype]
+pub enum DataKey {
+    UserA,
+    UserB,
+}
+
+env.storage().persistent().set(&DataKey::UserA, &1u32);
+env.storage().persistent().set(&DataKey::UserB, &2u32);
+```
+
+Key re-use across different storage tiers (`instance` vs `persistent` vs `temporary`) is **not** flagged — those namespaces are isolated at the host level.
+
+</Accordion>
+
+<Accordion title="S006 — Unsafe Patterns (unsafe_patterns)">
+
+**What triggers it**
+
+The `analyze_unsafe_patterns` visitor (backed by `UnsafeVisitor`) scans the full file AST for `panic!` macros, `.unwrap()`, and `.expect()` method calls, recording line numbers from `proc-macro2` span locations. This overlaps with S002 but operates as a broader file-scope visitor rather than being limited to `impl` blocks.
+
+**Fixed code**
+
+Same remediation as S002: replace `unwrap`/`expect` with `?` or explicit `match`/`if let`, and replace `panic!` with `panic_with_error!` for typed contract errors.
+
+</Accordion>
+
+<Accordion title="S007 — Custom Rule Match (custom_rule)">
+
+**What triggers it**
+
+Any line that matches a regular expression defined under `[[custom_rules]]` in `.sanctify.toml`. Custom rules can enforce project-specific conventions that Sanctifier's built-in detectors don't cover.
+
+**Configuration**
+
+```toml
+[[custom_rules]]
+name = "no_unsafe_block"
+pattern = "unsafe \\{"
+severity = "error"
+
+[[custom_rules]]
+name = "todo_comment"
+pattern = "TODO"
+severity = "info"
+```
+
+**Example trigger**
+
+```rust
+pub fn my_fn() {
+    // TODO: implement this             // S007: todo_comment
+    unsafe {                           // S007: no_unsafe_block
+        let x = 1;
+    }
+}
+```
+
+Custom rules are evaluated with `regex::Regex` against each source line. Invalid regex patterns are silently skipped.
+
+</Accordion>
+
+<Accordion title="S008 — Event Inconsistency (events)">
+
+**What triggers it**
+
+The `scan_events` scanner collects all `env.events().publish(topics, data)` calls and checks two conditions:
+
+1. **Inconsistent schema**: the same event name is published with different numbers of topics in different code paths.
+2. **Optimizable topic**: a topic uses a string literal where `symbol_short!` would suffice (≤9 bytes saves host gas).
+
+**Vulnerable code**
+
+```rust
+// S008: "transfer" published with 2 topics here ...
+env.events().publish(("transfer", from), amount);
+
+// ... and with 3 topics elsewhere in the same file
+env.events().publish(("transfer", from, to), amount);
+```
+
+**Fixed code**
+
+```rust
+// Consistent schema — always 3 topics for "transfer"
+env.events().publish(
+    (symbol_short!("transfer"), from, to),
+    amount,
+);
+```
+
+Use `symbol_short!` for all topic names ≤9 bytes and keep the topic count consistent across every emit site for the same event name.
+
+</Accordion>
+
+<Accordion title="S009 — Unhandled Result (logic)">
+
+**What triggers it**
+
+The `scan_unhandled_results` visitor finds calls in public `impl` functions where the called function returns a `Result` but the return value is neither bound to a variable, matched with `?` or `match`, nor consumed by `unwrap`/`expect`/`map`/`and_then`.
+
+**Vulnerable code**
+
+```rust
+fn internal_fn() -> Result<u32, Error> { Ok(42) }
+
+#[contractimpl]
+impl MyContract {
+    pub fn public_fn(env: Env) -> u32 {
+        internal_fn(); // S009: Result is discarded
+        0
+    }
+}
+```
+
+**Fixed code**
+
+```rust
+pub fn public_fn(env: Env) -> Result<u32, Error> {
+    let val = internal_fn()?;   // propagate with ?
+    Ok(val)
+}
+```
+
+</Accordion>
+
+<Accordion title="S010 — Upgrade Risk (upgrades)">
+
+**What triggers it**
+
+The `analyze_upgrade_patterns` scanner identifies public functions whose names match upgrade/admin patterns (`upgrade`, `set_admin`, `update_admin`, `transfer_admin`, `deploy`, `set_authorized`, etc.) and flags them with a governance finding when no timelock or multi-sig check is evident in the function body.
+
+**Vulnerable code**
+
+```rust
+pub fn upgrade(env: Env, wasm_hash: BytesN<32>) {
+    // S010: no require_auth, no timelock — anyone can upgrade
+    env.deployer().update_current_contract_wasm(wasm_hash);
+}
+```
+
+**Fixed code**
+
+```rust
+pub fn upgrade(env: Env, admin: Address, wasm_hash: BytesN<32>) {
+    admin.require_auth();
+    env.deployer().update_current_contract_wasm(wasm_hash);
+}
+```
+
+For high-value contracts, also consider a timelock or governance vote before the upgrade is applied.
+
+</Accordion>
+
+<Accordion title="S011 — SMT Invariant Violation (formal_verification)">
+
+**What triggers it**
+
+Emitted by `sanctifier prove` when `SmtProver` or `SmtInvariantVerifier` returns `ProofStatus::Violated` — meaning Z3 found a concrete counterexample demonstrating that the invariant can be broken. The finding includes the counterexample variable assignments.
+
+**Example output**
+
+```
+S011  balance_non_negative  VIOLATED
+      Counterexample: from_balance=0, amount=1, result_balance=-1
+      Call: transfer(from_balance=0, amount=1) -> result_balance = -1
+```
+
+This invariant will remain VIOLATED until an underflow guard (`amount <= from_balance`) is added before the subtraction.
+
+</Accordion>
+
+<Accordion title="S012 — Hardcoded Address (code_hygiene)">
+
+**What triggers it**
+
+Detection of hardcoded address strings or secret literals in authentication contexts. Hardcoding an admin address prevents key rotation and leaks the privileged address in the contract bytecode.
+
+**Vulnerable code**
+
+```rust
+// S012: admin address baked into source
+const ADMIN: &str = "GABC...XYZ";
+
+pub fn admin_action(env: Env) {
+    let caller = env.invoker();
+    assert_eq!(caller.to_string(), ADMIN);
+}
+```
+
+**Fixed code**
+
+Store the admin address in persistent storage during `initialize` and read it back on each privileged call:
+
+```rust
+pub fn admin_action(env: Env) {
+    let admin: Address = env.storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .expect("not initialized");
+    admin.require_auth();
+}
+```
+
+</Accordion>
+
+<Accordion title="S013 — Edge-Case Amount Validation (code_hygiene)">
+
+**What triggers it**
+
+Transfer, mint, or burn functions that do not include an `amount > 0` guard or, for transfers, a `from != to` check. Missing these guards can lead to zero-amount events, self-transfer edge cases, or unexpected state in downstream logic.
+
+**Vulnerable code**
+
+```rust
+pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+    // S013: no amount > 0 guard, no from != to check
+    from.require_auth();
+    // ... balance update
+}
+```
+
+**Fixed code**
+
+```rust
+pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+    assert!(amount > 0, "amount must be positive");
+    assert!(from != to, "self-transfer not allowed");
+    from.require_auth();
+    // ... balance update
+}
+```
+
+</Accordion>
+
+<Accordion title="S014 — Deprecated SDK Function (code_hygiene)">
+
+**What triggers it**
+
+Usage of a `soroban-sdk` host function that has been superseded by a newer, preferred API. Deprecated functions may be removed in future Stellar protocol upgrades.
+
+The finding message includes the suggested replacement. Update to the replacement to maintain forward compatibility.
+
+</Accordion>
+
+<Accordion title="S015 — Dead Code / Always-True Guard (code_hygiene)">
+
+**What triggers it**
+
+Constant folding analysis detects conditions that are always `true` or always `false` based on literal values visible in the same scope — for example `if 1 > 0 { ... }` or `assert!(true)`. Always-true guards waste gas; always-false branches are dead code that confuses reviewers.
+
+**Vulnerable code**
+
+```rust
+pub fn always_passes(env: Env, amount: i128) {
+    assert!(true, "this assertion does nothing");   // S015: dead guard
+}
+```
+
+</Accordion>
+
+<Accordion title="S016 — Error Code Collision (code_hygiene)">
+
+**What triggers it**
+
+A `#[contracterror]` enum whose variants share the same `u32` discriminant. Duplicate discriminants cause the contract ABI to map two distinct error names to the same wire value, making client-side error handling ambiguous.
+
+**Vulnerable code**
+
+```rust
+#[contracterror]
+pub enum Error {
+    NotFound    = 1,
+    Unauthorized = 1,  // S016: duplicate discriminant
+}
+```
+
+**Fixed code**
+
+```rust
+#[contracterror]
+pub enum Error {
+    NotFound     = 1,
+    Unauthorized = 2,  // unique discriminants
+}
+```
+
+</Accordion>
+
+<Accordion title="S017 — Fee Rounding (arithmetic)">
+
+**What triggers it**
+
+Fee or interest calculations that use integer division in a way that rounds to zero for small amounts. An attacker can exploit micro-amounts to evade fees entirely.
+
+**Vulnerable code**
+
+```rust
+pub fn calculate_fee(amount: i128, fee_bps: i128) -> i128 {
+    // S017: rounds to zero when amount < 10_000 / fee_bps
+    amount * fee_bps / 10_000
+}
+```
+
+**Fixed code**
+
+```rust
+pub fn calculate_fee(amount: i128, fee_bps: i128) -> i128 {
+    // Ceiling division prevents rounding to zero
+    (amount * fee_bps + 9_999) / 10_000
+}
+```
+
+Always verify that the minimum fee is at least 1 for any non-zero amount.
+
+</Accordion>
+
+<Accordion title="SANCT_UNWRAP — Entrypoint Unwrap (panic_handling)">
+
+**What triggers it**
+
+`unwrap()`, `expect(..)`, and risky `unwrap_or_default()` calls inside `#[contractimpl]` entrypoints specifically. In a contract entrypoint, an attacker-controlled missing value can abort the whole transaction or silently turn absent financial state into a default value (e.g. returning a zero balance that was never set).
+
+```rust
+#[contractimpl]
+impl Token {
+    pub fn balance(env: Env, id: Address) -> i128 {
+        // SANCT_UNWRAP: unwrap_or_default silently returns 0 for accounts
+        // that never held tokens — callers may misinterpret this as a real zero balance
+        env.storage()
+            .persistent()
+            .get(&DataKey::Balance(id))
+            .unwrap_or_default()
+    }
+}
+```
+
+**Fixed code**
+
+Prefer explicit handling: return a typed `Result`, map missing state to a domain-specific `Error`, or use `unwrap_or(0)` only when zero is the *intended* contract state for all uninitialized accounts and that semantics is clearly documented:
+
+```rust
+pub fn balance(env: Env, id: Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Balance(id))
+        .unwrap_or(0)   // explicit zero default: uninitialised account has zero balance
+}
+```
+
+</Accordion>
+
+<Accordion title="SANCT_ARG_DOS — Argument DoS (denial_of_service)">
+
+**What triggers it**
+
+A contract entrypoint that iterates over a `Vec` or `Map` argument without a visible length cap. A malicious caller can pass an arbitrarily large collection, causing the transaction to consume enough instructions to hit Soroban's per-transaction gas limit and deny service to legitimate users.
+
+**Vulnerable code**
+
+```rust
+pub fn batch_transfer(env: Env, recipients: Vec<Address>, amounts: Vec<i128>) {
+    // SANCT_ARG_DOS: no length check — caller controls loop iterations
+    for (recipient, amount) in recipients.iter().zip(amounts.iter()) {
+        // ... transfer logic
+    }
+}
+```
+
+**Fixed code**
+
+```rust
+const MAX_BATCH: u32 = 50;
+
+pub fn batch_transfer(env: Env, recipients: Vec<Address>, amounts: Vec<i128>) {
+    assert!(recipients.len() <= MAX_BATCH, "batch too large");
+    for (recipient, amount) in recipients.iter().zip(amounts.iter()) {
+        // ... transfer logic
+    }
+}
+```
+
+Always enforce an explicit upper bound on any argument that drives loop iterations.
+
+</Accordion>
+
+---
+
+## Where Codes Appear
+
+Finding codes surface in three places:
+
+<CardGroup cols={3}>
+  <Card title="Terminal Output" icon="terminal">
+    `sanctifier analyze` prints each finding with its code, severity colour, message, and file location.
+  </Card>
+  <Card title="JSON findings[]" icon="code">
+    Each item in `findings` carries a `"code"` string field matching one of the constants above.
+  </Card>
+  <Card title="error_codes object" icon="book">
+    The top-level `error_codes` object in the JSON report maps every code to its `category` and `description`.
+  </Card>
+</CardGroup>
+
+```json
+{
+  "findings": [
+    {
+      "code": "S001",
+      "severity": "warning",
+      "message": "Missing require_auth in state-mutating function 'set_data'",
+      "location": "src/lib.rs:12"
+    }
+  ],
+  "error_codes": {
+    "S001": {
+      "category": "authentication",
+      "description": "Missing authentication guard in a state-mutating function"
+    }
+  }
+}
+```
+
+<Info>
+  All code constants are defined in `sanctifier-core/src/finding_codes.rs` and re-exported via `all_finding_codes()`, which powers both the JSON report table and the compile-time uniqueness test that prevents accidental duplicate codes.
+</Info>

@@ -1,0 +1,292 @@
+---
+title: "Use @sanctifier/sdk in Node.js Applications"
+sidebarTitle: "Node.js"
+description: "Run the Sanctifier Soroban security analysis engine inside Node.js 18+ scripts, CLIs, and servers — zero native dependencies, pure WASM."
+---
+
+The Node.js entry of `@sanctifier/sdk` loads the WASM bundle synchronously via CommonJS `require` during module initialisation, so there is no async setup step. You can call `analyze()` immediately after importing.
+
+## Requirements
+
+- **Node.js 18 or later.** The package uses `node:module` built-ins and relies on the native WebAssembly runtime available since Node 8, but the test suite and the package `engines` field pin the minimum to 18.
+- **No native add-ons.** The analyzer runs entirely inside the WASM sandbox.
+
+## Imports
+
+<Tabs>
+  <Tab title="ESM">
+    ```typescript
+    // Resolve via the package root — the exports map sends this to the Node build.
+    import { analyze, findingCodes, coreVersion, init, SanctifierError } from "@sanctifier/sdk";
+
+    // Or reference the Node entry explicitly.
+    import { analyze, analyzeSync } from "@sanctifier/sdk/node";
+    ```
+  </Tab>
+  <Tab title="CommonJS">
+    ```javascript
+    // The package ships dist/node/index.cjs for CommonJS consumers.
+    const { analyze, findingCodes, coreVersion, SanctifierError } = require("@sanctifier/sdk");
+
+    // Explicit node sub-path:
+    const { analyzeSync } = require("@sanctifier/sdk/node");
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  The `main` field in `package.json` points to `./dist/node/index.cjs`, so
+  `require("@sanctifier/sdk")` works without any bundler or transpiler. The
+  `module` field points to `./dist/node/index.js` (ESM) for bundlers that
+  respect it.
+</Note>
+
+## CJS vs ESM exports
+
+The package `exports` map controls which file is resolved:
+
+| Condition | File |
+|-----------|------|
+| `"."` + `import` | `dist/node/index.js` (ESM) |
+| `"."` + `require` | `dist/node/index.cjs` (CJS) |
+| `"./node"` + `import` | `dist/node/index.js` |
+| `"./node"` + `require` | `dist/node/index.cjs` |
+| `"./browser"` | `dist/browser/index.js` |
+
+If you import `@sanctifier/sdk` in a bundler that sets the `browser` condition
+(Vite, webpack with `target: "web"`, etc.), the bundler will resolve the browser
+build instead. In pure Node.js no extra configuration is needed.
+
+## Complete working example
+
+The snippet below mirrors the patterns used in the SDK's own test suite.
+
+```typescript
+import { readFile } from "node:fs/promises";
+import {
+  analyze,
+  findingCodes,
+  coreVersion,
+  SanctifierError,
+  type AnalysisReport,
+  type Finding,
+  type Severity,
+} from "@sanctifier/sdk";
+
+// 1. (Optional) Print the embedded core version for audit logs.
+console.log("sanctifier-core:", coreVersion());
+
+// 2. Read a Soroban contract source file.
+const source = await readFile("contracts/token.rs", "utf8");
+
+// 3. Analyze with a high-severity failure gate.
+let report: AnalysisReport;
+try {
+  report = await analyze(source, { failOn: "high" });
+} catch (err) {
+  if (err instanceof SanctifierError) {
+    console.error(
+      `Build failed: ${err.report.summary.total} finding(s); ` +
+      `threshold breached at '${err.threshold}'.`
+    );
+    console.error(`First offender: ${err.message}`);
+    process.exit(1);
+  }
+  throw err;
+}
+
+// 4. Print the severity summary.
+const { summary } = report;
+console.log(
+  `Analysis passed — ${summary.total} finding(s): ` +
+  `${summary.critical} critical, ${summary.high} high, ` +
+  `${summary.medium} medium, ${summary.low} low, ${summary.info} info`
+);
+
+// 5. Print each finding.
+for (const finding of report.findings) {
+  const line = finding.line != null ? `:${finding.line}` : "";
+  console.log(
+    `  [${finding.severity.toUpperCase()}] ${finding.code}  ${finding.location}${line}`
+  );
+  console.log(`    ${finding.message}`);
+}
+```
+
+## Using `failOn` to gate CI pipelines
+
+Set `failOn` to the minimum severity that should block a build. `analyze()` rejects
+with a `SanctifierError` as soon as the first offending finding is encountered. The
+full report is attached to the error so you can still render a summary.
+
+```typescript
+import { analyze, SanctifierError } from "@sanctifier/sdk";
+
+async function auditContract(source: string): Promise<void> {
+  try {
+    // Fail the build on any high or critical finding.
+    await analyze(source, { failOn: "high" });
+    console.log("No high/critical findings — audit passed.");
+  } catch (err) {
+    if (err instanceof SanctifierError) {
+      const { summary, findings } = err.report;
+      console.error(`Audit failed (threshold: ${err.threshold})`);
+      console.error(`  Total: ${summary.total}`);
+
+      // The full findings list is available even when failOn throws.
+      for (const f of findings) {
+        if (f.severity === "critical" || f.severity === "high") {
+          console.error(`  ${f.code}  ${f.severity}  ${f.message}`);
+        }
+      }
+      process.exit(1);
+    }
+    throw err;
+  }
+}
+```
+
+<Warning>
+  `SanctifierError` attaches the **full** report, including lower-severity
+  findings, not just the ones that tripped the threshold. Check `err.threshold`
+  to know which severity level was configured as the gate.
+</Warning>
+
+## Filtering findings by severity
+
+`report.findings` is a plain array. Use standard `Array` methods to slice it by
+severity, code, or any other property.
+
+```typescript
+import { analyze } from "@sanctifier/sdk";
+import type { Finding, Severity } from "@sanctifier/sdk";
+
+const SEVERITY_ORDER: Record<Severity, number> = {
+  info: 0,
+  low: 1,
+  medium: 2,
+  high: 3,
+  critical: 4,
+};
+
+const report = await analyze(source);
+
+// All findings at medium severity or above.
+const actionable: Finding[] = report.findings.filter(
+  (f) => SEVERITY_ORDER[f.severity] >= SEVERITY_ORDER["medium"]
+);
+
+// Only authentication findings.
+const authFindings = report.findings.filter(
+  (f) => f.category === "authentication"
+);
+
+// Group by severity.
+const bySeverity = Object.groupBy(report.findings, (f) => f.severity);
+console.log("High findings:", bySeverity.high?.length ?? 0);
+```
+
+## Using `analyzeSync`
+
+The `analyzeSync` export runs the same analysis synchronously. It is only available
+from the Node entry — the browser entry does not expose it.
+
+```typescript
+import { analyzeSync } from "@sanctifier/sdk/node";
+
+// Useful in CLI scripts where top-level await is unavailable.
+const report = analyzeSync(source, { failOn: "critical" });
+console.log(report.summary.total, "finding(s)");
+```
+
+<Tip>
+  For long-running processes or servers, prefer `analyze()` (async) so the
+  WASM execution does not block the Node event loop. For one-shot scripts and
+  CLI tools, `analyzeSync` is perfectly fine.
+</Tip>
+
+## Querying the finding code catalog
+
+`findingCodes()` returns the live catalog embedded in the WASM bundle — one entry
+per stable code from `S001` through `S016` plus any additions in the installed version.
+
+```typescript
+import { findingCodes } from "@sanctifier/sdk";
+import type { FindingCodeEntry } from "@sanctifier/sdk";
+
+const catalog: FindingCodeEntry[] = findingCodes();
+
+// Print every code with its category and description.
+for (const entry of catalog) {
+  console.log(`${entry.code}  [${entry.category}]  ${entry.description}`);
+}
+
+// Look up a specific code.
+const s001 = catalog.find((e) => e.code === "S001");
+console.log(s001?.description);
+// → "Mutating function missing require_auth"
+```
+
+## Checking the core version
+
+Use `coreVersion()` to record the exact analyzer version in audit logs or to
+assert a minimum version in automated tooling.
+
+```typescript
+import { coreVersion } from "@sanctifier/sdk";
+
+const version = coreVersion();
+console.log("Running sanctifier-core", version);
+
+// Assert a minimum version in tests.
+const [major, minor] = version.split(".").map(Number);
+if (major < 1) {
+  throw new Error(`sanctifier-core ${version} is below the required 1.x baseline`);
+}
+```
+
+## Running custom rules
+
+Supply `customRules` in `AnalyzeOptions` to add project-specific regex checks on
+top of the built-in rule set. Each match surfaces as a finding with code `S007`.
+
+```typescript
+import { analyze } from "@sanctifier/sdk";
+import type { CustomRule } from "@sanctifier/sdk";
+
+const projectRules: CustomRule[] = [
+  {
+    name: "no_hardcoded_keys",
+    pattern: "G[A-Z2-7]{55}",  // Matches Stellar public key format
+    severity: "error",
+  },
+  {
+    name: "no_todo_comments",
+    pattern: "TODO|FIXME|HACK",
+    severity: "warning",
+  },
+];
+
+const report = await analyze(source, { customRules: projectRules });
+
+// Custom rule matches are also in report.raw.custom_rule_matches.
+for (const match of report.raw.custom_rule_matches) {
+  console.log(
+    `[${match.severity}] Rule '${match.rule_name}' matched at line ${match.line}: ${match.snippet}`
+  );
+}
+```
+
+## `init()` in Node.js
+
+The Node entry exports a no-op `init()` that returns `Promise.resolve()` immediately.
+This lets you write isomorphic library code that calls `init()` before `analyze()`
+without branching on the runtime.
+
+```typescript
+// Works in both Node and browser without any runtime check.
+import { init, analyze } from "@sanctifier/sdk";
+
+await init(); // no-op in Node, loads WASM in browsers
+const report = await analyze(source);
+```

@@ -1,0 +1,304 @@
+---
+title: "Static Analysis for Soroban Smart Contracts"
+sidebarTitle: "Static Analysis"
+description: "How Sanctifier parses Rust source with syn, walks the AST, and runs its built-in detector families to surface vulnerabilities before deployment."
+---
+
+Sanctifier's static analysis engine parses your contract's Rust source code with the [`syn`](https://docs.rs/syn) crate, constructs a full AST, and runs a suite of detector visitors across every `impl` block, `fn` body, and `#[contracttype]` declaration it finds. Analysis is deterministic and entirely offline — no network calls, no running WASM. Each detector emits structured findings that are aggregated into a JSON report at the end of a run.
+
+## How the AST Walk Works
+
+When you run `sanctifier analyze ./contracts/my-token`, the `Analyzer` struct in `sanctifier-core` does the following for each `.rs` file:
+
+<Steps>
+  <Step title="Parse source to AST">
+    `syn::parse_str::<syn::File>(source)` is called. On parse failure the file is skipped silently — broken syntax produces no false positives.
+  </Step>
+  <Step title="Dispatch to visitors">
+    Each detector is a `syn::visit::Visit` implementation that traverses the AST tree. Separate visitors handle auth gaps, panic patterns, arithmetic operators, storage method calls, and event publish calls.
+  </Step>
+  <Step title="Aggregate findings">
+    Individual detector results are collected into the unified `RuleViolation` type, each carrying a `code`, `severity`, `message`, and `location` string. The `RuleRegistry` folds these into the final report.
+  </Step>
+  <Step title="Emit JSON report">
+    `sanctifier analyze --json` serialises the `findings` array alongside a `severity_summary` counter and the `error_codes` table, making the output machine-readable for CI integrations.
+  </Step>
+</Steps>
+
+Panics inside any visitor are caught by `with_panic_guard` (a `std::panic::catch_unwind` wrapper) so a single malformed expression never crashes the whole scan.
+
+---
+
+## Detector Families
+
+### S001 — Authentication Gaps
+
+The auth-gap detector walks every `pub fn` in every `impl` block and checks whether a state-mutating function calls `require_auth` or `require_auth_for_args` before writing to storage.
+
+**Vulnerable pattern:**
+
+```rust
+#[contractimpl]
+impl MyContract {
+    // S001: writes to storage without any require_auth call
+    pub fn set_data(env: Env, val: u32) {
+        env.storage().instance().set(&DataKey::Val, &val);
+    }
+}
+```
+
+**Compliant pattern:**
+
+```rust
+#[contractimpl]
+impl MyContract {
+    pub fn set_data(env: Env, val: u32) {
+        env.require_auth();                               // auth guard present
+        env.storage().instance().set(&DataKey::Val, &val);
+    }
+}
+```
+
+The heuristic inspects the receiver chain of `.set()`, `.update()`, and `.remove()` method calls for any token that contains `"storage"`, `"persistent"`, `"temporary"`, or `"instance"`.
+
+---
+
+### S002 — Panic Handling
+
+The panic detector visits every `syn::Expr::Macro` node looking for `panic!`, and every `syn::ExprMethodCall` looking for `.unwrap()` and `.expect()`. It fires inside all `impl` functions, both public and private.
+
+**Vulnerable patterns:**
+
+```rust
+pub fn unsafe_fn(env: Env) {
+    panic!("Something went wrong");               // S002: panic!
+}
+
+pub fn unsafe_unwrap(env: Env) {
+    let x: Option<u32> = None;
+    let y = x.unwrap();                           // S002: unwrap
+}
+
+pub fn unsafe_expect(env: Env) {
+    let x: Option<u32> = None;
+    let y = x.expect("Failed to get x");          // S002: expect
+}
+```
+
+The companion code `SANCT_UNWRAP` is emitted specifically for `.unwrap()`, `.expect()`, and risky `.unwrap_or_default()` calls inside `#[contractimpl]` entrypoints, where an attacker-triggered missing value can abort the transaction or silently initialize financial state to zero.
+
+**Preferred alternative:**
+
+```rust
+pub fn safe_fn(env: Env) -> Result<(), Error> {
+    let x: Option<u32> = env.storage().instance().get(&DataKey::Val);
+    let val = x.ok_or(Error::NotFound)?;          // typed error propagation
+    Ok(())
+}
+```
+
+---
+
+### S003 — Arithmetic Overflow
+
+The `ArithVisitor` walks `syn::ExprBinary` and `syn::ExprAssign` nodes looking for `+`, `-`, `*`, `+=`, `-=`, and `*=` operators in contract `impl` functions. One finding is emitted per `(function_name, operator)` pair to keep output actionable — multiple uses of the same operator in one function produce a single diagnostic.
+
+**Vulnerable patterns:**
+
+```rust
+pub fn add_balances(env: Env, a: u64, b: u64) -> u64 {
+    a + b              // S003: unchecked addition
+}
+
+pub fn subtract(env: Env, total: u128, amount: u128) -> u128 {
+    total - amount     // S003: unchecked subtraction
+}
+
+pub fn multiply(env: Env, price: u64, qty: u64) -> u64 {
+    price * qty        // S003: unchecked multiplication
+}
+```
+
+**Safe alternatives:**
+
+```rust
+pub fn add_safe(env: Env, a: u64, b: u64) -> Option<u64> {
+    a.checked_add(b)                              // returns None on overflow
+}
+
+pub fn sub_safe(env: Env, total: i128, amount: i128) -> Result<i128, Error> {
+    total.checked_sub(amount).ok_or(Error::Underflow)
+}
+```
+
+Each finding's `suggestion` field names the corresponding `checked_*` method (`checked_add`, `checked_sub`, `checked_mul`).
+
+---
+
+### S004 — Storage Limits
+
+The ledger-size detector walks `#[contracttype]` structs and enums, estimates the serialized byte size of each field using conservative type-size heuristics, and emits a warning when the total approaches or exceeds the configured `ledger_limit` (default 64,000 bytes, matching Stellar's 64 KB ledger-entry limit).
+
+| Type | Estimated bytes |
+|---|---|
+| `u32`, `i32`, `bool` | 4 |
+| `u64`, `i64` | 8 |
+| `u128`, `i128`, `I128`, `U128` | 16 |
+| `Address` | 32 |
+| `Bytes`, `BytesN`, `String`, `Symbol` | 64 |
+| `Vec<T>` | 8 + size(T) |
+| `Map<K, V>` | 16 + 2 × (size(K) + size(V)) |
+
+**Example that triggers S004:**
+
+```rust
+#[contracttype]
+pub struct VaultState {
+    pub buffer: Bytes,           // 64 bytes estimated
+    pub large: u128,             // 16 bytes
+    // total: 80 bytes — under 64 KB, but approaches warning at 80% (51,200 bytes)
+}
+```
+
+The `approaching_threshold` config (default `0.8`) controls when the `ApproachingLimit` level fires versus `ExceedsLimit`.
+
+---
+
+### S005 — Storage Collisions
+
+The `StorageVisitor` tracks every storage key — string literals, `Symbol::new` calls, `symbol_short!` macros, and named constants — grouped by storage type (`Instance`, `Persistent`, `Temporary`). After the full file walk, `final_check()` emits a `StorageCollisionIssue` for each key that appears in the same storage tier more than once.
+
+**Vulnerable pattern:**
+
+```rust
+#[contractimpl]
+impl MyContract {
+    pub fn write_a(env: Env) {
+        // S005: "USER" used twice in persistent storage
+        env.storage().persistent().set(&"USER", &1u32);
+    }
+
+    pub fn write_b(env: Env) {
+        // S005: collision with write_a
+        env.storage().persistent().set(&"USER", &2u32);
+    }
+}
+```
+
+Note that key re-use **across** storage types (`instance`, `persistent`, `temporary`) is not flagged — Stellar's storage model isolates those namespaces at the host level.
+
+---
+
+### S007 — Custom Rules
+
+Custom rules let you define project-specific lint patterns as regular expressions in your `.sanctify.toml` configuration.
+
+```toml
+[[custom_rules]]
+name = "no_hardcoded_secret"
+pattern = "SECRET_KEY"
+severity = "error"
+
+[[custom_rules]]
+name = "todo_comment"
+pattern = "TODO"
+severity = "info"
+```
+
+Each rule is matched line-by-line with `regex::Regex`. A `CustomRuleMatch` is emitted for every line where the pattern fires, carrying the rule name, line number, source snippet, and severity.
+
+```rust
+pub fn my_fn() {
+    // TODO: implement proper error handling   // S007: todo_comment
+    let secret = "SECRET_KEY_VALUE";          // S007: no_hardcoded_secret
+}
+```
+
+---
+
+### S008 — Event Inconsistency
+
+The event scanner checks calls to `env.events().publish(topics, data)` across the entire file and flags two patterns:
+
+1. **Inconsistent topic counts**: the same event name is emitted with different numbers of topics in different code paths.
+2. **Gas-optimizable topics**: string topics that could be replaced with `symbol_short!` to save host gas.
+
+**Vulnerable pattern:**
+
+```rust
+// S008: "transfer" emitted with 2 topics here …
+env.events().publish(("transfer", from), data);
+
+// … but with 3 topics elsewhere in the same file
+env.events().publish(("transfer", from, to), data);
+```
+
+**Efficient pattern:**
+
+```rust
+// symbol_short! keeps topic encoding inline in the word tag (≤9 bytes)
+env.events().publish(
+    (symbol_short!("transfer"), from, to),
+    amount,
+);
+```
+
+---
+
+## JSON Report Structure
+
+Running `sanctifier analyze --json` produces a report with the following top-level keys:
+
+```json
+{
+  "findings": [
+    {
+      "code": "S001",
+      "severity": "warning",
+      "message": "Missing require_auth in state-mutating function 'set_data'",
+      "location": "src/lib.rs:12"
+    }
+  ],
+  "severity_summary": {
+    "error": 0,
+    "warning": 3,
+    "info": 1
+  },
+  "error_codes": {
+    "S001": { "category": "authentication", "description": "Missing authentication guard in a state-mutating function" },
+    "S002": { "category": "panic_handling",  "description": "panic!/unwrap/expect usage that may cause runtime aborts" }
+  }
+}
+```
+
+Each item in `findings` always carries a `code` field that corresponds to a row in `error_codes`. See the [Finding Codes Reference](/concepts/finding-codes) for a complete table.
+
+---
+
+## Configuring the Scan
+
+Create a `.sanctify.toml` at the workspace root to control which detectors run and how thresholds are applied:
+
+```toml
+# .sanctify.toml
+ignore_paths = ["target", ".git", "tests"]
+ledger_limit = 64000
+approaching_threshold = 0.8
+strict_mode = false
+
+enabled_rules = [
+  "auth_gaps",
+  "panics",
+  "arithmetic",
+  "ledger_size",
+  "events",
+]
+```
+
+<Note>
+  The `enabled_rules` list is declarative today: any name present in the list
+  activates the corresponding built-in detector. Rules not listed are still
+  loaded by the `RuleRegistry` but their findings are omitted from the final
+  report. This means adding new rules to the registry never changes existing CI
+  baselines unless the name also appears in your config.
+</Note>

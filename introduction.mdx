@@ -1,0 +1,111 @@
+---
+title: "Sanctifier: Security & Formal Verification for Soroban"
+sidebarTitle: "Introduction"
+description: "Sanctifier is a Rust-native security and formal verification suite for Stellar Soroban smart contracts — catch vulnerabilities before deployment."
+---
+
+Sanctifier is a comprehensive security and formal verification suite built specifically for [Stellar Soroban](https://soroban.stellar.org/) smart contracts. In the high-stakes environment of DeFi and decentralized applications, "code is law" only holds true if the code is correct. Sanctifier ensures your contracts are not just compiled, but *sanctified* — rigorously scanned for authorization gaps, overflow risks, and storage misuse before a single byte touches the network.
+
+## Why Sanctifier?
+
+Soroban smart contracts are immutable once deployed. A missing `require_auth()` call, an unchecked arithmetic operation, or a ledger entry that silently exceeds the 64 KB size limit can result in lost funds, bricked contracts, or exploitable backdoors — with no patch path available after the fact. Sanctifier catches these classes of vulnerabilities at development time, during CI, and at runtime, giving you multiple layers of defense before and after deployment.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run your first security scan in under five minutes with a single `cargo install` command.
+  </Card>
+  <Card title="Installation" icon="wrench" href="/installation">
+    Full installation instructions for Cargo, Docker, and optional formal-verification dependencies.
+  </Card>
+  <Card title="Static Analysis" icon="magnifying-glass" href="/concepts/static-analysis">
+    Learn how Sanctifier scans your Rust/Soroban source for auth gaps, panics, arithmetic bugs, and more.
+  </Card>
+  <Card title="Formal Verification" icon="shield-check" href="/concepts/formal-verification">
+    Use `sanctifier prove` with Z3 and Kani to verify invariants with mathematical certainty.
+  </Card>
+</CardGroup>
+
+## Key Features
+
+### Static Sanctification
+
+Sanctifier scans your Rust/Soroban source before deployment to detect:
+
+- **Authorization gaps** — flags any function that writes to contract storage without calling `require_auth()` or `require_auth_for_args()`.
+- **Panics and unwraps** — locates every `panic!`, `unwrap()`, and `expect()` that can abort a transaction with an opaque error.
+- **Unchecked arithmetic** — identifies bare `+`, `-`, and `*` operators that can silently overflow on `wasm32` release builds.
+- **Ledger size warnings** — estimates serialized struct sizes and warns when an entry approaches the 64 KB network limit.
+- **Event consistency** — checks that events emitted under the same name always use the same topic schema across all call sites.
+- **Upgrade pattern analysis** — detects contracts with upgrade mechanisms that lack a corresponding `init()` function for safe state migration.
+- **Custom rules** — regex-based patterns defined in `.sanctify.toml` let you enforce project-specific coding standards.
+
+### Formal Verification
+
+The `sanctifier prove` command runs SMT-based formal verification on Soroban token contract invariants using the Z3 solver. For deeper model-checking, `sanctifier verify` validates `#[sanctify::invariant]` declarations across a contract or workspace using the Kani verifier. These tools prove that invariants hold for *all* possible inputs — not just the ones your tests cover.
+
+### Runtime Guardians
+
+The `sanctifier-guards` crate provides a library of hook-based guards that you embed in your existing contracts. The `SanctifiedGuard` trait enables runtime invariant checks that execute with every transaction, giving you a live safety net alongside compile-time analysis.
+
+### Developer Workflow Integration
+
+- **Watch mode** — `sanctifier watch` re-runs analysis automatically on every source file change, with debouncing.
+- **Baseline & diff** — snapshot findings with `sanctifier baseline`, then use `sanctifier diff` to compare against a git reference and surface only *new* regressions in pull requests.
+- **JSON output** — `--format json` produces machine-readable findings for CI pipelines.
+- **ZK attestations** — `sanctifier attest` generates a zero-knowledge proof that a scan passed a given score threshold, without revealing the full report.
+- **Security badges** — `sanctifier badge` creates an SVG badge and Markdown snippet from a JSON scan report.
+- **Vulnerability database** — `sanctifier cve` searches, lists, and exports the public Soroban/Stellar CVE database.
+
+## Components
+
+Sanctifier is organized as a Cargo workspace. Each crate has a focused responsibility:
+
+| Component | Crate / Package | Role |
+|---|---|---|
+| CLI | `sanctifier-cli` | The `sanctifier` binary — all commands live here |
+| Core engine | `sanctifier-core` | Static analysis rules, SMT integration, call-graph logic |
+| Runtime guards | `sanctifier-guards` | Embeddable hook-based invariant guards for Soroban contracts |
+| Proc-macro | `sanctify-macros` | `#[sanctify::invariant]` attribute macro for declarative invariants |
+| WASM / JS SDK | `sanctifier-wasm` | Compiled WASM bindings for the `@sanctifier/sdk` npm package |
+
+<Info>
+  The VS Code extension surfaces Sanctifier findings inline as you edit, powered by the same `sanctifier-core` analysis engine as the CLI. It is available separately on the VS Code Marketplace.
+</Info>
+
+## Architecture Overview
+
+```
+Your Soroban Contract (Rust source)
+        │
+        ▼
+┌──────────────────┐
+│  sanctifier-cli  │  ← developer-facing CLI (`sanctifier analyze`, `prove`, etc.)
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│  sanctifier-core │  ← static analysis rules, SMT solver bridge, call-graph engine
+└────────┬─────────┘
+         │
+    ┌────┴────────────────────────────┐
+    │                                 │
+    ▼                                 ▼
+┌──────────────┐             ┌──────────────────┐
+│ sanctifier-  │             │   sanctify-       │
+│   guards     │             │   macros          │
+│ (runtime)    │             │ (#[invariant])    │
+└──────────────┘             └──────────────────┘
+```
+
+The CLI parses your project's `.sanctify.toml` config, feeds `.rs` source files into `sanctifier-core`, and formats the resulting findings as terminal-friendly text or structured JSON. For formal verification, `sanctifier-core` delegates to Z3 (via the `z3` crate) or spawns Kani as a subprocess.
+
+<Note>
+  Finding codes `S001` through `S007` map each class of vulnerability to a stable, linkable identifier. See the [Finding Codes reference](/concepts/finding-codes) for the full table.
+</Note>
+
+## Next Steps
+
+- **[Quickstart](/quickstart)** — install the CLI and run your first scan in five minutes.
+- **[Installation](/installation)** — full prerequisites and installation options including Docker.
+- **[Configuration](/guides/configuration)** — customize `.sanctify.toml` with rules, ignore paths, and custom patterns.
+- **[CI/CD Integration](/guides/ci-cd)** — wire Sanctifier into GitHub Actions or any pipeline using `--format json`.

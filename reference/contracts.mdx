@@ -1,0 +1,351 @@
+---
+title: "Example Soroban Contracts and Security Templates"
+sidebarTitle: "Example Contracts"
+description: "Production-ready and intentionally vulnerable Soroban contract templates for learning security patterns, running detectors, and Kani formal verification."
+---
+
+The `contracts/` directory of the Sanctifier repository contains a curated set of Soroban smart contracts that serve two purposes: some are hardened reference implementations you can adapt directly in your projects, while others are intentionally insecure and exist only to exercise Sanctifier's detectors and formal verification harnesses. Every contract is a real, compilable Rust crate that targets `wasm32-unknown-unknown`.
+
+<CardGroup cols={2}>
+  <Card title="amm-pool" icon="arrow-right-arrow-left" href="#amm-pool">
+    Hardened AMM with slippage protection, MEV resistance, k-invariant proofs, and 14 property tests.
+  </Card>
+  <Card title="reentrancy-guard" icon="shield-halved" href="#reentrancy-guard">
+    `no_std`-compatible reentrancy lock with four Kani-verified state-machine proofs.
+  </Card>
+  <Card title="runtime-guard-wrapper" icon="eye" href="#runtime-guard-wrapper">
+    Wraps any contract with pre/post execution guards, metrics collection, and audit-trail events.
+  </Card>
+  <Card title="protected-vault" icon="vault" href="#protected-vault">
+    Vault contract integrating `reentrancy-guard`; includes integration tests that catch simulated attacks.
+  </Card>
+  <Card title="token-invariants" icon="circle-check" href="#token-invariants">
+    Token contract with `#[sanctify::invariant]` annotations and Kani harnesses for balance and supply proofs.
+  </Card>
+  <Card title="sep41-token-invariants" icon="coins" href="#sep41-token-invariants">
+    SEP-41 standard token with formal invariant proofs covering transfer, mint, burn, and approve flows.
+  </Card>
+  <Card title="vulnerable-contract" icon="bug" href="#vulnerable-contract">
+    Intentionally insecure contract used to validate Sanctifier's static-analysis detectors.
+  </Card>
+  <Card title="token-with-bugs" icon="triangle-exclamation" href="#token-with-bugs">
+    Token with deliberate bugs (missing auth, no init guard) for detector regression testing.
+  </Card>
+  <Card title="kani-poc" icon="flask" href="#kani-poc">
+    Proof-of-concept Kani harnesses demonstrating the pure-function verification strategy.
+  </Card>
+  <Card title="zk-verifier" icon="key" href="#zk-verifier">
+    On-chain Groth16 ZK proof verifier using `ark-groth16` and `ark-bls12-381`.
+  </Card>
+</CardGroup>
+
+## Using contracts as templates
+
+Clone the repository and copy any hardened contract crate into your workspace. Each crate is independent (its own `Cargo.toml`) and depends only on `soroban-sdk` and, where relevant, the workspace-local `reentrancy-guard` crate. Add the workspace path dependency then run the standard Soroban build:
+
+```bash
+cargo build -p amm-pool --release --target wasm32-unknown-unknown
+```
+
+To run Sanctifier against a contract immediately:
+
+```bash
+sanctifier analyze contracts/amm-pool
+```
+
+---
+
+## amm-pool
+
+**Location:** `contracts/amm-pool/`
+
+A fully hardened Automated Market Maker (AMM) liquidity pool that implements the constant product formula (`k = reserve_a × reserve_b`). This contract is intended as a production-ready starting point for any DEX integration on Stellar.
+
+**Key security patterns demonstrated:**
+
+- **Slippage protection** — The `swap` function accepts a `min_amount_out` parameter; the transaction reverts if the calculated output falls below it, preventing sandwich attacks.
+- **MEV resistance** — A `deadline` (Unix timestamp) parameter causes stale transactions to revert automatically.
+- **K-invariant enforcement** — After every swap the contract explicitly verifies `new_k >= old_k`, providing an on-chain assertion that the constant product property is never violated.
+- **Checked arithmetic throughout** — All balance and reserve math uses `checked_add`, `checked_mul`, and `checked_div`; no raw `+`/`*` operators appear in financial code paths.
+
+**Test coverage:**
+
+| Suite | Count | Tool |
+|-------|-------|------|
+| Unit tests | 4 | `cargo test` |
+| Property tests | 14 | `proptest` |
+| Formal verification harnesses | 6 | Kani |
+
+```rust
+pub fn swap(
+    env: Env,
+    user: Address,
+    token_in: Address,
+    amount_in: u128,
+    min_amount_out: u128,   // slippage guard
+    deadline: u64,          // MEV guard
+) -> u128
+```
+
+Run the full test suite:
+
+```bash
+cd contracts/amm-pool
+cargo test
+PROPTEST_CASES=10000 cargo test --test proptest_amm  # high-intensity property testing
+cargo kani --harness verify_constant_product_invariant
+```
+
+---
+
+## reentrancy-guard
+
+**Location:** `contracts/reentrancy-guard/`
+
+A lightweight, `#![no_std]`-compatible reentrancy guard crate for Soroban. It stores a single `u32` lock flag under the storage key `RE_GRD` in Soroban instance storage. Calling `enter()` while the flag is already set causes an immediate `panic!("reentrancy detected")`, aborting the transaction before any state mutation can occur.
+
+**Key security patterns demonstrated:**
+
+- **Storage-backed mutex** — The lock survives cross-contract call boundaries because it lives in instance storage, not a local variable.
+- **Pure state-transition core** — `enter_pure` and `exit_pure` are side-effect-free functions that can be exhaustively verified by Kani without any host-type stubs.
+- **`no_std` compatibility** — Works in any Soroban contract without pulling in `std`.
+
+**Kani proofs:**
+
+| Harness | Property |
+|---------|----------|
+| `verify_enter_fails_when_locked` | Entering a locked guard always returns `Err` |
+| `verify_enter_succeeds_when_unlocked` | Entering an unlocked guard always returns `Ok(Locked)` |
+| `verify_exit_always_unlocks` | Exit always transitions to `Unlocked` |
+| `verify_guard_state_machine` | Exhaustive two-state transition check |
+
+```rust
+use reentrancy_guard::ReentrancyGuard;
+
+pub fn withdraw(env: Env, amount: i128) {
+    let guard = ReentrancyGuard::new(&env);
+    guard.enter();  // panics with "reentrancy detected" if re-entered
+    // ... safely perform the withdrawal ...
+    guard.exit();
+}
+```
+
+```bash
+cd contracts/reentrancy-guard
+cargo kani
+```
+
+---
+
+## runtime-guard-wrapper
+
+**Location:** `contracts/runtime-guard-wrapper/`
+
+A Soroban contract that wraps any other deployed contract and enforces runtime validation before and after every function call. It is the reference integration for the `sanctifier-guards` crate's `guard_invariant_result!` macro, which emits structured `inv_fail` audit events when an invariant breaks.
+
+**Key security patterns demonstrated:**
+
+- **Pre-execution guards** — Verifies the wrapped contract address is configured and that instance-storage integrity keys are present before forwarding any call.
+- **Post-execution invariant checks** — After each guarded call the wrapper asserts the `invariants_checked` counter strictly advanced; a stuck counter surfaces as a `GuardError::InvariantCounterStuck` event.
+- **Audit-trail events** — The `guard_invariant_result!` macro publishes `inv_fail` events with a machine-readable payload; off-chain indexers can subscribe to a single topic to observe invariant failures across all instrumented contracts.
+- **Bounded storage** — The call log is capped at 100 entries and metrics at 1,000 entries, preventing the instance-storage capacity DoS described in `SOB-2024-025`.
+
+**Public interface:**
+
+```rust
+pub fn init(env: Env, wrapped_contract: Address)
+pub fn execute_guarded(env: Env, function_name: Symbol, args: Vec<Val>) -> Result<Val, Error>
+pub fn get_stats(env: Env) -> (u32, u32, u32)  // (invariants_checked, executions, guard_failures)
+pub fn health_check(env: Env) -> bool
+```
+
+Deploy and invoke on testnet:
+
+```bash
+sanctifier deploy ./contracts/runtime-guard-wrapper --network testnet --validate
+
+soroban contract invoke \
+  --id "$CONTRACT_ID" --network testnet \
+  -- init "$WRAPPED_CONTRACT"
+
+soroban contract invoke \
+  --id "$CONTRACT_ID" --network testnet \
+  -- health_check
+```
+
+---
+
+## protected-vault
+
+**Location:** `contracts/protected-vault/`
+
+A minimal vault contract that integrates the `reentrancy-guard` crate. The `deposit` and `withdraw` entry points both call `guard.enter()` before touching storage, making it impossible for a malicious callee to re-enter the vault mid-operation. The crate includes an integration test that simulates a reentrancy attack and asserts the guard causes the transaction to revert.
+
+**Key security patterns demonstrated:**
+
+- Direct integration of `reentrancy-guard` as a workspace dependency.
+- Positive access-control (`amount > 0` assertion before state mutation).
+- Demonstrates the pattern described in vulnerability entry `SOB-2024-015`.
+
+```rust
+pub fn withdraw(env: Env, amount: i128) {
+    assert!(amount > 0, "amount must be positive");
+    let guard = ReentrancyGuard::new(&env);
+    guard.enter();
+    let balance: i128 = env.storage().instance().get(&BALANCE_KEY).unwrap_or(0);
+    assert!(balance >= amount, "insufficient balance");
+    env.storage().instance().set(&BALANCE_KEY, &(balance - amount));
+    guard.exit();
+}
+```
+
+---
+
+## token-invariants
+
+**Location:** `contracts/token-invariants/`
+
+A token contract whose pure business logic is separated into a `pure` module so that Kani can reason over it without needing host-type stubs. The contract layer uses `#[sanctify::invariant(...)]` annotations that `sanctifier verify` picks up and dispatches to the Z3 SMT backend.
+
+**Key security patterns demonstrated:**
+
+- **Core logic separation** — `pure::{mint_pure, burn_pure, transfer_pure}` contain no `Env`, `Address`, or `Symbol` dependencies, making them directly Kani-verifiable.
+- **Annotated invariants** — `#[sanctify::invariant(balance >= 0)]` and supply-conservation assertions are declared inline and automatically checked by `sanctifier verify`.
+- **Kani harnesses** — Located in `src/kani_proofs.rs`; verify overflow safety and conservation properties.
+
+```bash
+sanctifier verify contracts/token-invariants
+sanctifier prove --path contracts/token-invariants --invariant supply_conserved
+cargo kani --manifest-path contracts/token-invariants/Cargo.toml
+```
+
+---
+
+## sep41-token-invariants
+
+**Location:** `contracts/sep41-token-invariants/`
+
+Extends `token-invariants` to implement the full [SEP-41](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0041.md) fungible token interface including `transfer_from`, `approve`, and allowance management. Kani harnesses cover the allowance race condition (`SOB-2024-017`) and the `transfer_from` allowance check (`SOL-2024-009`).
+
+**Key security patterns demonstrated:**
+
+- Allowance decrement enforced before balance mutation, preventing `SOL-2024-009`.
+- Allowance race condition guard (set to zero before non-zero), preventing `SOB-2024-017`.
+- All five token operations (`transfer`, `transfer_from`, `approve`, `mint`, `burn`) have Kani harnesses in `src/kani_proofs.rs`.
+
+```bash
+sanctifier verify contracts/sep41-token-invariants
+cargo kani --manifest-path contracts/sep41-token-invariants/Cargo.toml
+```
+
+---
+
+## vulnerable-contract
+
+**Location:** `contracts/vulnerable-contract/`
+
+<Warning>
+This contract is **intentionally insecure**. Never deploy it to mainnet or testnet. It exists solely so Sanctifier's detector suite has a ground-truth target to validate against.
+</Warning>
+
+Demonstrates several of the most common Soroban security pitfalls, including:
+
+- `set_admin` without any `require_auth` call (triggers finding `S001` / `SOL-2024-001`).
+- A contrasting `set_admin_secure` function showing the correct pattern.
+
+Run Sanctifier against it to see the expected findings:
+
+```bash
+sanctifier analyze contracts/vulnerable-contract --format json
+```
+
+The `tests/` directory contains golden-snapshot tests (`insta`) that lock in the exact findings, so any detector regression causes CI to fail.
+
+---
+
+## token-with-bugs
+
+**Location:** `contracts/token-with-bugs/`
+
+<Warning>
+This contract is **intentionally buggy**. It is a detector regression fixture, not a template for production code.
+</Warning>
+
+A token contract with deliberate security defects used to test and maintain the accuracy of Sanctifier's built-in detectors:
+
+- `initialize` does not persist `admin`, `name`, or `symbol`, leaving the initialization guard incomplete (triggers `SOL-2024-001` pattern).
+- Missing `require_auth` on privileged entry points.
+- Intentional arithmetic issues for `S003` detector coverage.
+
+---
+
+## kani-poc
+
+**Location:** `contracts/kani-poc/`
+
+A proof-of-concept crate demonstrating the **Core Logic Separation** pattern for Kani verification. Because Kani cannot model the Soroban host types (`Env`, `Address`, `Symbol`) directly, this contract extracts pure initialization and token-operation logic into host-free functions that Kani can reason about exhaustively.
+
+**Key patterns demonstrated:**
+
+- `attempt_initialize(is_initialized: bool) -> Result<(), &'static str>` — pure function verified to reject double-initialization for all possible boolean inputs.
+- Shows how to structure a contract so the security-critical arithmetic is separated from the host-interaction layer, enabling Kani coverage without stubs.
+
+```bash
+cd contracts/kani-poc
+cargo kani
+```
+
+---
+
+## zk-verifier
+
+**Location:** `contracts/zk-verifier/`
+
+An on-chain Groth16 zero-knowledge proof verifier built with [`ark-groth16`](https://docs.rs/ark-groth16) and [`ark-bls12-381`](https://docs.rs/ark-bls12-381). The contract accepts a serialized verifying key (stored on initialization) and a proof blob (passed per invocation), and returns a boolean indicating whether the proof is valid.
+
+**Key security patterns demonstrated:**
+
+- Storing large cryptographic artifacts (verifying keys) in persistent storage rather than instance storage, avoiding `SOB-2024-025`.
+- Using `ark-serialize::CanonicalDeserialize` to safely parse untrusted byte inputs.
+- `wee_alloc` as a global allocator for lean WASM output.
+
+```rust
+pub fn init(env: Env, verifying_key: Bytes)
+pub fn verify(env: Env, proof: Bytes, public_inputs: Bytes) -> bool
+```
+
+<Info>
+The `zk-verifier` contract depends on `ark-*` crates that require `alloc`. Compile with `--release` to keep WASM size manageable; debug builds may exceed Soroban's contract size limits.
+</Info>
+
+---
+
+## Running all contract tests
+
+From the repository root, run the full contract test suite in one command:
+
+```bash
+cargo test --workspace --exclude sanctifier-cli --exclude sanctifier-core
+```
+
+To run Sanctifier analysis across every contract at once:
+
+```bash
+sanctifier analyze contracts/
+```
+
+<Tip>
+Exclude the intentionally vulnerable fixtures when running in CI to avoid false-positive gate failures:
+
+```bash
+sanctifier analyze contracts/ \
+  --format json \
+  2>&1 | grep -v "vulnerable-contract\|token-with-bugs"
+```
+
+Or add them to `ignore_paths` in your `.sanctify.toml`:
+
+```toml
+ignore_paths = ["contracts/vulnerable-contract", "contracts/token-with-bugs"]
+```
+</Tip>

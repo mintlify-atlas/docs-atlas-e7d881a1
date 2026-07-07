@@ -1,0 +1,247 @@
+---
+title: "Formal Verification with Kani Rust Verifier"
+sidebarTitle: "Kani Integration"
+description: "Use Kani to formally verify pure contract logic, understand Soroban host-type limitations, and run proof harnesses with Sanctifier."
+---
+
+Kani is a model-checking tool that proves properties about Rust code through symbolic execution — rather than testing with example inputs, it exhaustively explores all possible values that a variable could hold and checks whether an assertion can ever be violated. For Soroban smart contracts, where incorrect arithmetic or logic errors can be irreversible on-chain, formal proofs of critical properties provide a stronger safety guarantee than unit tests alone.
+
+Sanctifier integrates Kani through the `sanctifier verify` command and the `fv-kani.yml` GitHub Actions workflow, making it straightforward to add formal proofs to your CI pipeline alongside static analysis.
+
+---
+
+## Kani limitations with Soroban host types
+
+Kani requires the source code (or a verified model) of every function it symbolically executes. Soroban contracts communicate with the blockchain environment through `soroban_sdk::Env`, whose methods ultimately call `extern "C"` functions provided by the Stellar VM host — functions whose bodies are not available at contract compilation time.
+
+This creates hard limits on what Kani can verify directly:
+
+| Type | Limitation for Kani |
+|---|---|
+| `Env` | Opaque handle; all operations (storage get/set, `require_auth`, events) are FFI |
+| `Val` | Runtime value type; conversion and comparison require host calls |
+| `Symbol` | Opaque `u32` handle; `symbol_short!`, comparison, and display need the host |
+| `Address` | Opaque handle; `require_auth`, comparison, and display require host FFI |
+| `String`, `Bytes`, `Map`, `Vec` | Host-backed types; all operations delegate to env FFI |
+
+There is also a **state explosion** problem: while `soroban-env-host` provides a Rust implementation of the host environment (used for local testing with `soroban_sdk::testutils`), symbolically executing contracts linked against it is impractical. The host is large and complex, involves memory management and storage emulation, and pulls in many transitive dependencies. For non-trivial contracts, verification against the full host stack is either extremely slow or completely infeasible.
+
+**Authentication flows (`require_auth`) cannot be modelled by Kani.** Logic that depends on the content of `Address` or `Symbol` values loses semantic meaning if those types are modelled as plain integers.
+
+---
+
+## Core Logic Separation pattern
+
+The practical solution to these limitations is the **Core Logic Separation** pattern. The idea is to extract the critical business logic of a contract into pure Rust functions — no `soroban_sdk::Env`, no host types, only primitive Rust types like `i128` and `bool` — and verify those functions with Kani. The actual contract `#[contractimpl]` block becomes a thin layer that reads state from `env.storage()`, delegates to the verified pure functions, and writes results back.
+
+<Steps>
+  <Step title="Identify the logic to verify">
+    Focus on arithmetic-heavy or invariant-critical paths: balance transfers, mint/burn operations, initialisation guards, fee calculations. These are the functions where a bug can drain funds or break protocol invariants.
+  </Step>
+
+  <Step title="Extract pure functions">
+    Move the core arithmetic into standalone `pub fn` functions that take only primitive types (`i128`, `bool`, `u64`, etc.) and return `Result`. Place them in a dedicated module — conventionally named `pure.rs` or a `kani-poc` crate — so they can be imported by both the contract layer and proof harnesses.
+
+    The `contracts/kani-poc` crate demonstrates this with a standard token:
+
+    ```rust
+    // contracts/kani-poc/src/lib.rs — verified with Kani, pure primitives only
+
+    /// Attempt to initialise the token contract.
+    pub fn initialize_pure(is_initialized: bool) -> Result<(), &'static str> {
+        if is_initialized {
+            return Err("already initialized");
+        }
+        Ok(())
+    }
+
+    /// Transfer: deduct from sender, add to receiver.
+    pub fn transfer_pure(
+        balance_from: i128,
+        balance_to: i128,
+        amount: i128,
+    ) -> Result<(i128, i128), &'static str> {
+        if amount <= 0 {
+            return Err("Amount must be positive");
+        }
+        let new_from = balance_from
+            .checked_sub(amount)
+            .ok_or("Insufficient balance")?;
+        let new_to = balance_to
+            .checked_add(amount)
+            .ok_or("Receiver balance overflow")?;
+        Ok((new_from, new_to))
+    }
+
+    /// Mint: add to a balance.
+    pub fn mint_pure(balance: i128, amount: i128) -> Result<i128, &'static str> {
+        if amount <= 0 {
+            return Err("Mint amount must be positive");
+        }
+        balance.checked_add(amount).ok_or("Mint overflow")
+    }
+
+    /// Burn: subtract from a balance.
+    pub fn burn_pure(balance: i128, amount: i128) -> Result<i128, &'static str> {
+        if amount <= 0 {
+            return Err("Burn amount must be positive");
+        }
+        balance
+            .checked_sub(amount)
+            .ok_or("Insufficient balance to burn")
+    }
+    ```
+  </Step>
+
+  <Step title="Keep the contract layer thin">
+    The `#[contractimpl]` block should only marshal data: read balances from `env.storage()`, call the pure functions, and write results back. No logic lives here that is not already proven.
+
+    ```rust
+    // contracts/kani-poc/src/lib.rs — NOT verified, uses Host types
+    #[contractimpl]
+    impl TokenContract {
+        pub fn initialize(env: Env, _name: Symbol) {
+            let already: bool = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("init"))
+                .unwrap_or(false);
+            initialize_pure(already).expect("already initialized");
+            env.storage().instance().set(&symbol_short!("init"), &true);
+        }
+
+        // set_admin uses Env and Symbol — Kani cannot verify this
+        pub fn set_admin(env: Env, new_admin: Symbol) {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("admin"), &new_admin);
+        }
+    }
+    ```
+  </Step>
+
+  <Step title="Write proof harnesses">
+    Add harnesses inside a `#[cfg(kani)]` module. Each harness uses `kani::any()` to create symbolic (unconstrained) values, `kani::assume()` to narrow to a valid precondition domain, then asserts the property that must always hold.
+
+    ```rust
+    #[cfg(kani)]
+    mod verification {
+        use super::*;
+
+        #[kani::proof]
+        fn verify_transfer_pure_conservation() {
+            let balance_from: i128 = kani::any();
+            let balance_to: i128 = kani::any();
+            let amount: i128 = kani::any();
+
+            kani::assume(amount > 0);
+            kani::assume(balance_from >= amount);
+            kani::assume(balance_from <= i128::MAX);
+            kani::assume(balance_to >= 0);
+            kani::assume(balance_to <= i128::MAX - amount);
+            kani::assume(balance_from <= i128::MAX - balance_to);
+
+            let Ok((new_from, new_to)) = transfer_pure(balance_from, balance_to, amount) else {
+                panic!("transfer_pure failed despite valid preconditions");
+            };
+
+            assert!(new_from == balance_from - amount);
+            assert!(new_to == balance_to + amount);
+            assert!(
+                new_from + new_to == balance_from + balance_to,
+                "Conservation of supply"
+            );
+        }
+    }
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Proof harnesses in `contracts/kani-poc`
+
+The `kani-poc` crate ships eight proof harnesses that collectively cover the core token operations:
+
+| Harness | Property proven |
+|---|---|
+| `verify_initialize_fails_when_already_initialized` | `initialize_pure(true)` **always** returns `Err` — a set-up contract can never be re-initialised |
+| `verify_initialize_succeeds_when_not_initialized` | `initialize_pure(false)` **always** returns `Ok` — the first call on a fresh contract always succeeds |
+| `verify_initialize_idempotency_guarantee` | Exhaustive over all boolean states: double-initialisation is mathematically impossible |
+| `verify_transfer_pure_conservation` | Transfer preserves total supply: `new_from + new_to == balance_from + balance_to` |
+| `verify_transfer_pure_rejects_non_positive_amount` | Transfer fails with `Err` for every `amount <= 0` |
+| `verify_transfer_pure_rejects_underflow` | Transfer fails when `balance_from - amount` would underflow `i128` |
+| `verify_mint_pure` | Mint produces exactly `balance + amount` for all valid inputs |
+| `verify_burn_pure` | Burn produces exactly `balance - amount` for all valid inputs |
+
+---
+
+## Running Kani
+
+First install the Kani verifier and its backend:
+
+```bash
+cargo install --locked kani-verifier
+cargo kani setup
+```
+
+Run all harnesses in a single package:
+
+```bash
+# Run the kani-poc proof suite
+cargo kani --package kani-poc-contract
+
+# Run a specific harness
+cargo kani --package kani-poc-contract \
+    --harness verify_transfer_pure_conservation
+
+# Run the token-invariants harnesses
+cargo kani --package token-invariants
+```
+
+### Per-harness time budget
+
+For CI, pass `--harness-timeout` to bound the solver time per harness and `timeout` as a wall-clock cap on the whole package run:
+
+```bash
+timeout 900 cargo kani \
+    -p kani-poc-contract \
+    --harness-timeout 120s \
+    --output-format terse
+```
+
+### SMT latency benchmarking
+
+To compare proof strategy cost across strategies, Sanctifier includes an ignored benchmark in `sanctifier-core`:
+
+```bash
+cargo test -p sanctifier-core --test smt_latency_benchmark -- --ignored
+```
+
+This writes `target/smt-latency-report.json` with per-strategy min/avg/max and p95 latency in microseconds, useful for identifying the most expensive proof strategies in your CI budget.
+
+---
+
+## Integration with `sanctifier verify`
+
+The `sanctifier verify` command scans for `#[sanctify::invariant]` attributes, runs the Z3 SMT fast-path for integer equalities and tautologies, and delegates to Kani for more complex properties. It reports one of four statuses per invariant:
+
+| Status | Meaning |
+|---|---|
+| `PROVEN` | The Z3 SMT solver proved the invariant holds for all inputs |
+| `REFUTED` | A counterexample was found — the invariant is violated |
+| `UNKNOWN` | The solver could not determine the result within the time budget |
+| `KANI ↗` | The invariant requires Kani for a full proof; use `cargo kani` |
+
+```bash
+# Basic run
+sanctifier verify ./contracts/token-invariants
+
+# Treat UNKNOWN as a failure (strict mode)
+sanctifier verify ./contracts/token-invariants --strict
+
+# Emit machine-readable output
+sanctifier verify ./contracts/token-invariants --json
+```
+
+The `fv-kani.yml` GitHub Actions workflow runs all harnesses across `kani-poc-contract`, `token-invariants`, `amm-pool`, and `reentrancy-guard` on every push and pull request to `main`.

@@ -1,0 +1,236 @@
+---
+title: "Configure Sanctifier with .sanctify.toml"
+sidebarTitle: "Configuration"
+description: "Learn every .sanctify.toml key, how config discovery works, and how CLI flags override file settings for Sanctifier."
+---
+
+Sanctifier reads all of its analysis behaviour from a single TOML file named `.sanctify.toml`. You never point to it on the command line — instead, Sanctifier discovers it automatically by walking the directory tree upward from whatever path you are scanning. This page documents every supported key, the precedence rules, and how to validate that your file is working as intended.
+
+## How config discovery works
+
+For every command that needs configuration (`analyze`, `verify`, `callgraph`), Sanctifier performs the following search:
+
+1. Start in the directory of the path you passed (or the path itself if it is a directory).
+2. Look for `.sanctify.toml` in that directory.
+3. If not found, move to the parent directory and repeat.
+4. Continue up to the filesystem root.
+5. The **first** `.sanctify.toml` found wins.
+6. If none is found anywhere, Sanctifier falls back to its built-in defaults.
+
+This means a single `.sanctify.toml` at the root of a Cargo workspace applies to every contract crate beneath it. A contract crate can override the workspace config by placing its own `.sanctify.toml` inside its own directory.
+
+<Note>
+  A malformed `.sanctify.toml` (invalid TOML syntax or wrong value types) is **silently ignored** and built-in defaults are used in its place. Always validate your file after editing — see [Validating your configuration](#validating-your-configuration).
+</Note>
+
+<Tip>
+  Run `sanctifier init` to write a starter `.sanctify.toml` into the current directory. Pass `--force` to overwrite an existing file.
+</Tip>
+
+---
+
+## Key reference
+
+All keys are optional. Any key you omit falls back to the default shown in the table.
+
+| Key | Type | Default |
+|-----|------|---------|
+| `ignore_paths` | array of strings | `["target", ".git"]` |
+| `enabled_rules` | array of strings | `["auth_gaps", "panics", "arithmetic", "ledger_size", "events"]` |
+| `ledger_limit` | integer (bytes) | `64000` |
+| `approaching_threshold` | float 0.0–1.0 | `0.8` |
+| `strict_mode` | boolean | `false` |
+| `custom_rules` | array of tables | `[]` |
+
+---
+
+<ParamField path="ignore_paths" type="array of strings" default='["target", ".git"]'>
+  Directory name fragments that Sanctifier skips while walking the source tree. Matching is a **substring match against each directory name** (not a glob and not a full path). The fragment `"target"` will skip any directory whose name contains the word `target`. Use this to exclude build artifacts, vendored code, and snapshot fixtures.
+
+  ```toml
+  ignore_paths = ["target", ".git", "test_snapshots", "node_modules"]
+  ```
+</ParamField>
+
+<ParamField path="enabled_rules" type="array of strings" default='["auth_gaps", "panics", "arithmetic", "ledger_size", "events"]'>
+  The built-in detector families you intend to run. The recognized identifiers are:
+
+  | Identifier | Detector family | Finding code |
+  |---|---|---|
+  | `auth_gaps` | Missing `require_auth` on state-mutating functions | `S001` |
+  | `panics` | `panic!` / `unwrap` / `expect` usage | `S002` |
+  | `arithmetic` | Unchecked arithmetic (overflow/underflow) | `S003` |
+  | `ledger_size` | Ledger entry size limit analysis | `S004` |
+  | `events` | Inconsistent event topic counts / gas patterns | `S008` |
+  | `invariants` | Declared `#[sanctify::invariant]` checks | `S011` |
+
+  <Warning>
+    The built-in analyzer currently runs its full detector set regardless of this list. `enabled_rules` is **declarative intent** — it is validated by `sanctifier init` (must be non-empty) and reserved for future per-rule gating. Do not rely on removing an entry here to disable a built-in detector today. Custom rules added via `custom_rules` always execute.
+  </Warning>
+
+  ```toml
+  enabled_rules = ["auth_gaps", "panics", "arithmetic", "ledger_size", "invariants"]
+  ```
+</ParamField>
+
+<ParamField path="ledger_limit" type="integer (bytes)" default="64000">
+  The ledger-entry size budget in bytes used by the ledger-size detector (`S004`). Contract state estimated at or above this value is flagged as exceeding the limit. The default mirrors the Soroban network's actual ledger entry size limit.
+
+  This value is overridden for a single run by the `analyze --limit <bytes>` CLI flag. The flag itself also defaults to `64000`, so when you set `ledger_limit` in the file and do not pass `--limit`, the file value is used.
+
+  ```toml
+  ledger_limit = 64000
+  ```
+</ParamField>
+
+<ParamField path="approaching_threshold" type="float (0.0–1.0)" default="0.8">
+  The fraction of `ledger_limit` at which Sanctifier raises an **"approaching limit"** warning instead of a hard failure. With the defaults, state estimated at `0.8 × 64000 = 51200` bytes or more (but below the hard limit) is flagged as approaching. Lower this value to get earlier warnings; raise it to reduce noise.
+
+  ```toml
+  approaching_threshold = 0.75
+  ```
+</ParamField>
+
+<ParamField path="strict_mode" type="boolean" default="false">
+  When `true`, the ledger-size detector becomes more conservative: state estimated at **90% of `ledger_limit` or above** is treated as *exceeding* the limit rather than merely approaching it. Recommended for CI environments to fail builds well before the hard cap is reached.
+
+  ```toml
+  strict_mode = true
+  ```
+</ParamField>
+
+<ParamField path="custom_rules" type="array of tables">
+  User-defined regex rules, evaluated against contract source during `analyze`. Each match is reported under finding code `S007`. Custom rules always run and are not gated by `enabled_rules`.
+
+  Each `[[custom_rules]]` table takes the following fields:
+
+  | Field | Type | Required | Default | Notes |
+  |---|---|---|---|---|
+  | `name` | string | yes | — | Identifier shown in the report |
+  | `pattern` | string | yes | — | [`regex` crate](https://docs.rs/regex/latest/regex/#syntax) syntax |
+  | `severity` | string | no | `"warning"` | One of `info`, `warning`, `error` |
+
+  ```toml
+  [[custom_rules]]
+  name = "no_unsafe_block"
+  pattern = "unsafe\\s*\\{"
+  severity = "error"
+
+  [[custom_rules]]
+  name = "no_mem_forget"
+  pattern = "std::mem::forget"
+  severity = "warning"
+  ```
+</ParamField>
+
+---
+
+## TOML escaping for regex patterns
+
+TOML basic strings (double-quoted) treat the backslash as an escape character, so regex metacharacters that use `\` must be doubled. A regex like `unsafe\s*\{` becomes `"unsafe\\s*\\{"` in a double-quoted string.
+
+Alternatively, use a TOML **literal string** (single-quoted) — backslashes in literal strings are never interpreted as escape sequences:
+
+```toml
+# Basic string — backslashes must be doubled
+[[custom_rules]]
+name = "no_unsafe_block"
+pattern = "unsafe\\s*\\{"
+severity = "error"
+
+# Literal string — backslashes are literal, no doubling needed
+[[custom_rules]]
+name = "no_unwrap_in_prod"
+pattern = '\.unwrap\(\)'
+severity = "error"
+```
+
+---
+
+## Precedence
+
+When the same setting can be provided in multiple ways, Sanctifier resolves it in this order from highest to lowest priority:
+
+1. **Command-line flags** for the current run — currently `analyze --limit <bytes>` overrides `ledger_limit`.
+2. **The nearest `.sanctify.toml`** found by walking up from the scanned path.
+3. **Built-in defaults** — the values in the key reference table above.
+
+```
+analyze --limit 48000    →  wins (overrides everything)
+.sanctify.toml ledger_limit = 56000  →  used when --limit is not passed
+built-in default 64000   →  used when neither of the above is set
+```
+
+---
+
+## Complete annotated example
+
+The `.sanctify.toml` at the root of the Sanctifier repository uses the following configuration, which is a good starting point for most Soroban projects:
+
+```toml
+# .sanctify.toml
+# Discovered by walking up from the scanned path; the first file found wins.
+
+# Directory name fragments to skip while scanning (substring match).
+ignore_paths = ["target", ".git", "test_snapshots"]
+
+# Detector families you intend to run.
+enabled_rules = ["auth_gaps", "panics", "arithmetic", "ledger_size", "invariants"]
+
+# Ledger entry size budget in bytes. Overridden by `analyze --limit`.
+ledger_limit = 64000
+
+# Warn when estimated state reaches this fraction of ledger_limit (0.0–1.0).
+# Default is 0.8; not set here so the built-in default applies.
+
+# When true, treat state >= 90% of ledger_limit as exceeding (good for CI).
+strict_mode = false
+
+# Optional regex rules. Each match is reported as S007.
+[[custom_rules]]
+name = "no_unsafe_block"
+pattern = "unsafe\\s*\\{"
+severity = "error"
+
+[[custom_rules]]
+name = "no_mem_forget"
+pattern = "std::mem::forget"
+severity = "warning"
+```
+
+### Minimal config
+
+A minimal config that only customises ignored paths is perfectly valid — every other key falls back to its default:
+
+```toml
+ignore_paths = ["target", ".git", "vendor"]
+```
+
+### Strict CI-oriented config
+
+```toml
+ledger_limit = 64000
+approaching_threshold = 0.7
+strict_mode = true
+
+[[custom_rules]]
+name = "no_unwrap_in_prod"
+pattern = '\.unwrap\(\)'
+severity = "error"
+```
+
+---
+
+## Validating your configuration
+
+Because a malformed `.sanctify.toml` is silently ignored in favour of defaults, always confirm your file parses and takes effect before relying on it:
+
+```bash
+# Generate a fresh, known-good file to compare against your edited version.
+sanctifier init            # writes .sanctify.toml; use --force to overwrite
+
+# Run a scan and confirm your custom rules and limits appear in the output.
+sanctifier analyze . --format json | jq '.error_codes, .findings'
+```
+
+If a custom rule never fires or your `ledger_limit` seems to be ignored, check for a TOML syntax error — an unescaped `\` in a double-quoted regex pattern is the most common culprit. Also verify there is not a second `.sanctify.toml` higher up the tree that is being discovered first and shadowing your file.

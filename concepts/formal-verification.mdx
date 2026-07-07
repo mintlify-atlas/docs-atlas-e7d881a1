@@ -1,0 +1,324 @@
+---
+title: "Formal Verification of Soroban Token Invariants"
+sidebarTitle: "Formal Verification"
+description: "Prove Soroban contract invariants with Z3 SMT solving and Kani harnesses using Sanctifier's two-track formal verification pipeline."
+---
+
+Formal verification goes further than static analysis or runtime guards: it *proves* that a property holds for every possible input, not just the ones your tests happen to exercise. Sanctifier provides two complementary formal verification paths — an SMT-based prover backed by Z3 for algebraic tautologies, and Kani harnesses for exhaustive symbolic execution of pure Rust functions. Understanding when to use each approach, and why Soroban's host types make the pure-function separation pattern essential, is the foundation of effective contract verification.
+
+## Two Verification Approaches
+
+<CardGroup cols={2}>
+  <Card title="SMT via Z3 (sanctifier prove)" icon="square-root-variable">
+    Proves integer equalities and tautologies symbolically. Ideal for supply conservation, balance non-negativity, and arithmetic invariants that can be expressed as closed-form constraints.
+  </Card>
+  <Card title="Kani Harnesses (cargo kani)" icon="microscope">
+    Symbolically executes pure Rust functions. Proves correctness of transfer, mint, burn, and initialization logic for all possible `i128` inputs within specified bounds.
+  </Card>
+</CardGroup>
+
+---
+
+## SMT-Based Verification with Z3
+
+`sanctifier prove` dispatches contract invariants to the Z3 SMT solver via `SmtProver`. The prover encodes token-contract invariants as constraint satisfaction problems and asks Z3 to find a *violation*: if Z3 returns UNSAT (no violation exists), the invariant is **PROVEN**; if it returns SAT, it provides a concrete counterexample.
+
+### Built-in Token Invariants
+
+The `SmtProver` ships with three built-in invariants for token contracts:
+
+| Invariant | Description | Typical Result |
+|---|---|---|
+| `balance_non_negative` | Checks whether an unchecked transfer can drive a holder's balance below zero. | **VIOLATED** — no underflow guard means the model finds a trivial counterexample. |
+| `supply_conserved` | Proves that `new_from + new_to == balance_from + balance_to` holds for all valid (bounds-checked) transfers. | **PROVED** — supply conservation is a mathematical certainty under valid preconditions. |
+| `no_unauthorized_mint` | Checks whether a mint without `require_auth` allows arbitrary callers to inflate supply. | **VIOLATED** — any caller can mint when the auth check is missing. |
+
+### Running the Prover
+
+```bash
+# Prove all built-in token invariants and print a PROVEN / VIOLATED report
+sanctifier prove
+
+# Prove invariants declared with #[sanctify::invariant(...)] in a source file
+sanctifier verify ./contracts/my-token/src/lib.rs
+```
+
+### How the Supply Conservation Proof Works
+
+The `prove_supply_conserved` method models a transfer as pure integer arithmetic, asserts the negation of the conservation property, and checks satisfiability:
+
+```rust
+// From sanctifier-core/src/smt.rs — Z3 proof of supply conservation
+
+let new_from = Int::sub(ctx, &[&from_balance, &amount]);
+let new_to   = Int::add(ctx, &[&to_balance,   &amount]);
+
+let total_before = Int::add(ctx, &[&from_balance, &to_balance]);
+let total_after  = Int::add(ctx, &[&new_from,     &new_to    ]);
+
+// Assert the NEGATION: try to find inputs where total changes
+solver.assert(&total_after._eq(&total_before).not());
+
+// If UNSAT → no such inputs exist → supply conservation is PROVEN
+```
+
+### `SmtInvariantVerifier` for Inline Invariants
+
+For invariants declared with `#[sanctify::invariant(...)]`, the `SmtInvariantVerifier` handles two fast-path cases without requiring Z3 session setup:
+
+- **Integer literal equalities** (`42 == 42`): proven by constant comparison.
+- **Tautological equalities** (`x == x`): proven by token identity.
+
+Everything else — expressions that call user-defined functions — returns `Unsupported` and is redirected to Kani.
+
+```rust
+// PROVEN by SmtInvariantVerifier (integer literals)
+#[sanctify::invariant(42 == 42)]
+#[contractimpl]
+impl Token { ... }
+
+// UNSUPPORTED — dispatched to Kani instead
+#[sanctify::invariant(total_supply == sum_of_balances())]
+#[contractimpl]
+impl Token { ... }
+```
+
+---
+
+## Kani Harnesses for Pure Functions
+
+[Kani](https://model-checking.github.io/kani/) is a formal verification tool that symbolically executes Rust code. It works by treating function arguments as fully unconstrained symbolic values, then exhaustively checking whether any assertion can fail. For Soroban contracts, however, there is a fundamental obstacle.
+
+### Why Soroban Host Types Block Kani
+
+Soroban contracts interact with the blockchain via `soroban_sdk::Env`. Every `Env` method eventually calls `extern "C"` host functions that are defined at the Stellar VM layer — outside of any Rust source Kani can see.
+
+| Type | Limitation for Kani |
+|---|---|
+| `Env` | Opaque handle; all storage, event, auth, and crypto operations are FFI. |
+| `Val` | Runtime value type; conversion and comparison require host calls. |
+| `Symbol` | Opaque `u32` handle; `symbol_short!`, comparison, and display need the host. |
+| `Address` | Opaque handle; `require_auth`, comparison, and display require host. |
+| `String`, `Bytes`, `Map`, `Vec` | Host-backed types; all operations delegate to env FFI. |
+
+Attempting to run Kani directly against a `#[contractimpl]` block that reads from `env.storage()` results in unresolvable foreign-function stubs and state-space explosion.
+
+---
+
+## The Core Logic Separation Pattern
+
+The solution is to extract all verifiable business logic into **pure Rust functions** that take only primitive types and return `Result`. The contract layer becomes a thin wrapper that loads data from storage, calls the pure function, and writes results back.
+
+```
+┌──────────────────────────────────────────────────────┐
+│  #[contractimpl] layer  (thin — NOT verified by Kani) │
+│  • env.storage().persistent().get(...)                │
+│  • calls pure_fn(balance_from, balance_to, amount)    │
+│  • env.storage().persistent().set(...)                │
+└──────────────────────────────────────────────────────┘
+            │  only i128 / bool / primitives cross this boundary
+┌──────────────────────────────────────────────────────┐
+│  Pure logic layer        (VERIFIED by Kani)          │
+│  • transfer_pure(i128, i128, i128)                    │
+│  • mint_pure(i128, i128)                              │
+│  • burn_pure(i128, i128)                              │
+│  • initialize_pure(bool)                              │
+└──────────────────────────────────────────────────────┘
+```
+
+### Pure Functions from `contracts/kani-poc`
+
+These four functions from `contracts/kani-poc/src/lib.rs` are the canonical examples of the pattern:
+
+```rust
+// Verified with Kani — pure primitives only, no soroban_sdk dependency
+
+/// Attempt to initialise the token contract.
+pub fn initialize_pure(is_initialized: bool) -> Result<(), &'static str> {
+    if is_initialized {
+        return Err("already initialized");
+    }
+    Ok(())
+}
+
+/// Transfer: deduct from sender, add to receiver.
+pub fn transfer_pure(
+    balance_from: i128,
+    balance_to: i128,
+    amount: i128,
+) -> Result<(i128, i128), &'static str> {
+    if amount <= 0 {
+        return Err("Amount must be positive");
+    }
+    let new_from = balance_from
+        .checked_sub(amount)
+        .ok_or("Insufficient balance")?;
+    let new_to = balance_to
+        .checked_add(amount)
+        .ok_or("Receiver balance overflow")?;
+    Ok((new_from, new_to))
+}
+
+/// Mint: add to a balance.
+pub fn mint_pure(balance: i128, amount: i128) -> Result<i128, &'static str> {
+    if amount <= 0 {
+        return Err("Mint amount must be positive");
+    }
+    balance.checked_add(amount).ok_or("Mint overflow")
+}
+
+/// Burn: subtract from a balance.
+pub fn burn_pure(balance: i128, amount: i128) -> Result<i128, &'static str> {
+    if amount <= 0 {
+        return Err("Burn amount must be positive");
+    }
+    balance
+        .checked_sub(amount)
+        .ok_or("Insufficient balance to burn")
+}
+```
+
+The contract layer remains intentionally thin:
+
+```rust
+// Not verified — uses Host types
+#[contractimpl]
+impl TokenContract {
+    pub fn transfer(balance_from: i128, balance_to: i128, amount: i128) -> (i128, i128) {
+        // Load from storage, call pure function, write back
+        transfer_pure(balance_from, balance_to, amount).expect("transfer failed")
+    }
+
+    pub fn initialize(env: Env, _name: Symbol) {
+        let already: bool = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("init"))
+            .unwrap_or(false);
+        initialize_pure(already).expect("already initialized");
+        env.storage().instance().set(&symbol_short!("init"), &true);
+    }
+}
+```
+
+---
+
+## Kani Harnesses
+
+Harnesses live in `#[cfg(kani)] mod verification` blocks so they compile only when Kani is active. Each harness uses `kani::any()` to generate unconstrained symbolic values and `kani::assume()` to restrict the input domain to valid states.
+
+### Supply Conservation (`verify_transfer_pure_conservation`)
+
+```rust
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    #[kani::proof]
+    fn verify_transfer_pure_conservation() {
+        let balance_from: i128 = kani::any();
+        let balance_to: i128   = kani::any();
+        let amount: i128       = kani::any();
+
+        kani::assume(amount > 0);
+        kani::assume(balance_from >= amount);
+        kani::assume(balance_from <= i128::MAX);
+        kani::assume(balance_to >= 0);
+        kani::assume(balance_to <= i128::MAX - amount);
+        // Ensure new_from + new_to doesn't overflow
+        kani::assume(balance_from <= i128::MAX - balance_to);
+
+        let Ok((new_from, new_to)) = transfer_pure(balance_from, balance_to, amount) else {
+            panic!("transfer_pure failed despite valid preconditions");
+        };
+
+        assert!(new_from == balance_from - amount);
+        assert!(new_to   == balance_to   + amount);
+        assert!(
+            new_from + new_to == balance_from + balance_to,
+            "Conservation of supply"
+        );
+    }
+```
+
+### Full Harness Inventory
+
+| Harness | Property Proved |
+|---|---|
+| `verify_transfer_pure_conservation` | `new_from + new_to == balance_from + balance_to` for all valid inputs |
+| `verify_transfer_pure_rejects_non_positive_amount` | `transfer_pure` always returns `Err` when `amount <= 0` |
+| `verify_transfer_pure_rejects_underflow` | `transfer_pure` returns `Err` on `i128` underflow |
+| `verify_mint_pure` | Mint produces `balance + amount` for all valid inputs |
+| `verify_burn_pure` | Burn produces `balance - amount` for all valid inputs |
+| `verify_initialize_fails_when_already_initialized` | `initialize_pure(true)` always returns `Err` |
+| `verify_initialize_succeeds_when_not_initialized` | `initialize_pure(false)` always returns `Ok` |
+| `verify_initialize_idempotency_guarantee` | Exhaustive over all `bool` states: double-initialization is mathematically impossible |
+
+---
+
+## The `#[sanctify::invariant]` Proc-Macro
+
+The `sanctify-macros` crate provides a proc-macro attribute that attaches an invariant expression to an `impl` block. In a normal build the attribute is **transparent** — the `impl` block is emitted unchanged. Under `cargo kani` (`--cfg kani`), the macro additionally emits a `#[kani::proof]` harness that asserts the invariant expression.
+
+```rust
+use sanctify_macros::invariant;
+
+// In a normal build: the impl block passes through unchanged.
+// Under `--cfg kani`:  a #[kani::proof] harness is auto-generated.
+#[sanctify::invariant(total_supply == sum_of_balances())]
+#[contractimpl]
+impl Token {
+    pub fn total_supply(_env: Env) -> i128 { 0 }
+}
+```
+
+`sanctifier verify` scans source files for this attribute and dispatches invariant expressions to either the Z3 fast path (integer equalities and tautologies) or the Kani path (everything else).
+
+```
+sanctifier verify ./contracts/my-token/src/lib.rs
+
+  Token::total_supply == sum_of_balances()   →  KANI ↗  (dispatched to cargo kani)
+  42 == 42                                   →  PROVEN   (Z3: UNSAT in 1ms)
+  x == x                                     →  PROVEN   (tautology)
+```
+
+---
+
+## Running Verification
+
+### `sanctifier prove` — SMT invariants
+
+```bash
+# Prove all built-in token invariants with Z3
+sanctifier prove
+
+# Example output:
+#   balance_non_negative  VIOLATED  (counterexample: from_balance=0, amount=1, result=-1)
+#   supply_conserved      PROVED    (3 ms)
+#   no_unauthorized_mint  VIOLATED  (counterexample: caller=0, admin=1, mint_amount=1)
+```
+
+### `sanctifier verify` — inline invariants
+
+```bash
+# Scan source for #[sanctify::invariant(...)] and verify each one
+sanctifier verify ./contracts/my-token/src/lib.rs
+```
+
+### `cargo kani` — Kani harnesses
+
+```bash
+# Install Kani once
+cargo install --locked kani-verifier
+cargo kani setup
+
+# Run all harnesses in the kani-poc package
+cargo kani --package kani-poc-contract
+```
+
+<Warning>
+  Kani cannot verify any function that calls `soroban_sdk::Env` methods, uses
+  `Address`, `Symbol`, `Val`, or any other Soroban host-backed type. Attempting
+  to do so will produce unresolvable FFI stubs. Always extract the logic you
+  want to verify into pure functions first.
+</Warning>

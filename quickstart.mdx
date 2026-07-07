@@ -1,47 +1,187 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Sanctifier in 5 Minutes"
+sidebarTitle: "Quickstart"
+description: "Install the Sanctifier CLI, initialize a project config, and run a full static analysis scan on your Soroban contract in under five minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+Sanctifier's CLI is a single Rust binary. Once it's on your `PATH` you can analyze any Soroban contract directory with one command and get a prioritized list of security findings immediately — no cloud account, no API key, no setup wizard.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+This guide walks you from zero to a working scan in five minutes.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Install the CLI from source">
+    Clone the Sanctifier repository and install the binary with Cargo:
 
     ```bash
-    npm install your-package
+    git clone https://github.com/Centurylong/sanctifier.git
+    cd sanctifier
+    cargo install --path tooling/sanctifier-cli
+    ```
+
+    Cargo places the `sanctifier` binary in `~/.cargo/bin`. If that directory isn't already on your `PATH`, add it now:
+
+    ```bash
+    echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
+    source ~/.bashrc
+    ```
+
+    Confirm the installation:
+
+    ```bash
+    sanctifier --help
+    ```
+
+    <Note>
+      Sanctifier requires Rust **1.75 or later**. Run `rustc --version` to check. If you need to update, run `rustup update stable`.
+    </Note>
+  </Step>
+
+  <Step title="Initialize your project">
+    Navigate to the root of your Soroban contract crate and run `sanctifier init`. This generates a `.sanctify.toml` configuration file with sensible defaults:
+
+    ```bash
+    cd my-soroban-project
+    sanctifier init
+    ```
+
+    The generated `.sanctify.toml` looks like this:
+
+    ```toml
+    ignore_paths  = ["target", ".git", "test_snapshots"]
+    enabled_rules = ["auth_gaps", "panics", "arithmetic", "ledger_size", "invariants"]
+    ledger_limit  = 64000
+    strict_mode   = false
+
+    # Regex-based custom rules (optional)
+    [[custom_rules]]
+    name     = "no_unsafe_block"
+    pattern  = "unsafe\\s*\\{"
+    severity = "error"
+
+    [[custom_rules]]
+    name     = "no_mem_forget"
+    pattern  = "std::mem::forget"
+    severity = "warning"
+    ```
+
+    Commit this file to version control so your whole team shares the same rule set. You can add project-specific `[[custom_rules]]` entries at any time — each one is a regex pattern applied to every `.rs` file in scope.
+
+    <Tip>
+      `sanctifier init` is non-destructive. If a `.sanctify.toml` already exists in the current directory or any parent directory, Sanctifier will use that file automatically and `init` will warn you rather than overwrite it.
+    </Tip>
+  </Step>
+
+  <Step title="Run your first analysis">
+    Point `sanctifier analyze` at your contract directory. Sanctifier walks the source tree, applies all enabled rules, and prints a color-coded findings report:
+
+    ```bash
+    sanctifier analyze .
+    ```
+
+    You can also target a specific sub-directory or a single `.rs` file:
+
+    ```bash
+    sanctifier analyze ./contracts/my-token
+    sanctifier analyze ./contracts/my-token/src/lib.rs
+    ```
+
+    Here is what a real findings report looks like:
+
+    ```
+    ✨ Sanctifier: Valid Soroban project found at "./contracts/my-token"
+    🔍 Analyzing contract at "./contracts/my-token"...
+    ✅ Static analysis complete.
+
+    🛑 Found potential Authentication Gaps!
+       -> Function `transfer` is modifying state without require_auth()
+
+    🛑 Found explicit Panics/Unwraps!
+       -> Function `mint`: Using `unwrap` (Location: src/lib.rs:transfer)
+       💡 Tip: Prefer returning Result or Error types for better contract safety.
+
+    🔢 Found unchecked Arithmetic Operations!
+       -> Function `compound_interest`: Unchecked `+` (src/lib.rs:compound_interest)
+          💡 Use checked_add() or saturating_add() to prevent overflow.
+
+    ⚠️  Found Ledger Size Warnings!
+       LargeState approaches the ledger entry size limit!
+          Estimated size: 68200 bytes (Limit: 64000 bytes)
+
+    🔄 Upgrade Pattern Analysis
+       -> [missing_init] Contract has upgrade mechanism but no init function (src/lib.rs:42)
+          💡 Add an init() function to set post-upgrade state safely.
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+  <Step title="Understand the findings">
+    Each finding category points to a distinct class of vulnerability:
 
-    ```bash
-    your-cli start
-    ```
+    | Icon | Category | What it means |
+    |---|---|---|
+    | 🛑 | **Authentication Gap** | A state-mutating function calls no `require_auth()`. Anyone can invoke it. **Critical.** |
+    | 🛑 | **Panics / Unwraps** | `panic!`, `unwrap()`, or `expect()` abort the transaction opaquely and can enable denial-of-service. |
+    | 🔢 | **Unchecked Arithmetic** | Bare `+`, `-`, `*` can silently overflow on `wasm32` release builds, corrupting balances or state. |
+    | ⚠️ | **Ledger Size Warning** | An entry's estimated serialized size exceeds the 64 KB network limit and will fail at runtime. |
+    | 🔔 | **Event Consistency** | The same event name is published with different topic schemas across call sites, breaking indexers. |
+    | 📜 | **Custom Rule Match** | A pattern defined in your `.sanctify.toml` matched a line in the source. |
+    | 🔄 | **Upgrade Pattern** | An upgrade entry point lacks admin-gating or a corresponding `init()` for safe state migration. |
+
+    For a comprehensive explanation of every finding code (`S001`–`S007`) and recommended fixes, see the [Finding Codes reference](/concepts/finding-codes).
+
+    <Warning>
+      Authentication gap findings (🛑) should be treated as **critical severity**. A missing `require_auth()` call means any wallet address can call that function and mutate contract state without authorization.
+    </Warning>
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## What to do next
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+Once you've reviewed the initial findings, here are the most common next steps:
+
+**Fix and re-run.** Address findings in your source code and run `sanctifier analyze .` again to confirm they're resolved. Sanctifier exits with a non-zero status code when findings are present, which makes it straightforward to enforce in CI.
+
+**Set a baseline.** Once your project is in a known state, run `sanctifier baseline` to snapshot the current findings. Future runs of `sanctifier diff` will only surface *new* regressions relative to that baseline — useful for reviewing pull requests without noise from pre-existing issues.
+
+```bash
+sanctifier baseline
+```
+
+**Send webhook notifications.** Sanctifier can POST a summary to one or more webhook URLs when a scan completes — handy for Slack or Discord alerts:
+
+```bash
+sanctifier analyze . \
+  --webhook-url https://hooks.slack.com/services/XXX/YYY/ZZZ
+```
+
+**Generate a security badge.** Produce an SVG badge and Markdown snippet from a JSON report to display in your repository README:
+
+```bash
+sanctifier analyze . --format json > sanctifier-report.json
+sanctifier badge \
+  --report sanctifier-report.json \
+  --svg-output badges/sanctifier-security.svg \
+  --markdown-output badges/sanctifier-security.md
+```
+
+<Tip>
+  Pass `--format json` to get machine-readable output perfect for CI pipelines. The JSON report contains finding codes, locations, severities, and remediation hints — everything you need to fail a build on new high-severity findings or post results to a dashboard.
+
+  ```bash
+  sanctifier analyze . --format json
+  ```
 </Tip>
+
+## Keep up to date
+
+Check for and download the latest Sanctifier binary at any time with the built-in updater:
+
+```bash
+sanctifier update
+```
+
+## Further reading
+
+- [Installation](/installation) — full prerequisites, Docker setup, and optional formal-verification dependencies
+- [Configuration guide](/guides/configuration) — customize rules, ignore paths, and the ledger size limit
+- [CLI reference](/cli/analyze) — every flag and option for `sanctifier analyze`
+- [CI/CD integration](/guides/ci-cd) — wire Sanctifier into GitHub Actions

@@ -1,0 +1,65 @@
+---
+title: "Sanctifier CLI: All Commands at a Glance"
+sidebarTitle: "Overview"
+description: "Complete reference for the sanctifier command-line tool — security scanning, formal verification, and ZK attestation for Stellar Soroban contracts."
+---
+
+The `sanctifier` CLI is the primary interface to the Sanctifier security suite for Stellar Soroban smart contracts. It is a single binary that bundles static analysis, SMT-based formal verification, zero-knowledge attestation, vulnerability database querying, and developer workflow utilities into one cohesive tool. Every capability is exposed as a subcommand, and the binary has no global flags beyond `--help`; per-command options are documented on each command's page.
+
+## Usage pattern
+
+```bash
+sanctifier <COMMAND> [OPTIONS] [ARGS]
+```
+
+Running `sanctifier` without a subcommand, or with `--help`, prints the top-level help. Each subcommand also accepts `--help` for detailed per-command usage.
+
+## Configuration discovery
+
+Sanctifier looks for a `.sanctify.toml` file by walking up the directory tree from the target path. If no file is found the tool runs with built-in defaults. Use `sanctifier init` to scaffold the configuration file.
+
+## All commands
+
+| Command | Description |
+|---|---|
+| [`analyze`](/cli/analyze) | Scan a contract directory for vulnerabilities and emit a findings report |
+| [`verify`](/cli/verify) | Check `#[sanctify::invariant]` declarations using the Z3 SMT solver |
+| [`prove`](/cli/prove) | Run SMT-based formal verification on Soroban token contract invariants |
+| [`baseline`](/cli/baseline) | Snapshot current findings so future scans report only new ones |
+| [`diff`](/cli/diff) | Compare findings between the working tree and a git reference |
+| [`attest`](/cli/attest) | Generate or verify a zero-knowledge security attestation |
+| [`cve`](/cli/cve) | Search, list, show, and export the built-in Soroban CVE database |
+| [`callgraph`](/cli/other-commands#callgraph) | Generate a Graphviz DOT call graph of cross-contract calls |
+| [`watch`](/cli/other-commands#watch) | Watch source files and re-run analysis on every change |
+| [`badge`](/cli/other-commands#badge) | Generate a security status badge SVG and markdown snippet |
+| [`report`](/cli/other-commands#report) | Generate a security report from a previous scan |
+| [`init`](/cli/other-commands#init) | Initialize `.sanctify.toml` in the current project |
+| [`update`](/cli/other-commands#update) | Check for and download the latest Sanctifier binary |
+
+## Keeping the binary current
+
+Run `sanctifier update` at any time to check whether a newer release is available and download it automatically:
+
+```bash
+sanctifier update
+```
+
+<Note>
+  The `update` command replaces the binary in-place. On Linux and macOS the
+  binary must be writable by the current user. If Sanctifier was installed to a
+  system path (e.g. `/usr/local/bin`) you may need `sudo`.
+</Note>
+
+## Global behavior notes
+
+- **No global flags** — options like `--format`, `--quiet`, and `--json` are
+  scoped to individual commands. There is no single flag that changes behavior
+  across all commands.
+- **Config file** — `.sanctify.toml` is discovered automatically by walking up
+  from the target path. Most commands also accept explicit `--path` or positional
+  path arguments to override the search root.
+- **Exit codes** — commands that detect issues (e.g. `analyze`, `diff
+  --fail-on-new`, `verify --strict`) exit with a non-zero status code to
+  support CI pipelines.
+- **JSON output** — every command that produces structured output accepts a
+  `--format json` or `--json` flag so results can be piped into other tools.

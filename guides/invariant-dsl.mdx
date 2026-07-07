@@ -1,0 +1,262 @@
+---
+title: "Declare and Verify Contract Invariants"
+sidebarTitle: "Invariant DSL"
+description: "Use the #[sanctify::invariant] proc-macro to declare, verify, and formally prove contract invariants without touching the production binary."
+---
+
+Sanctifier provides a proc-macro attribute, `#[sanctify::invariant(expr)]`, that lets you declare contract invariants directly in source code alongside the `#[contractimpl]` block they describe. In a normal build the attribute is completely transparent — the production WASM binary is identical to the unannotated version. Under `cargo kani` the attribute additionally emits a `#[kani::proof]` harness, and the `sanctifier verify` command reports proof results through its Z3 SMT fast-path or by delegating to Kani.
+
+The `contracts/token-invariants` crate is the canonical example of this pattern and ships with six formal proof harnesses.
+
+---
+
+## Adding the proc-macro crate
+
+The `sanctify-macros` crate lives in `tooling/sanctify-macros`. Add it to your contract's `Cargo.toml`:
+
+```toml
+[dependencies]
+sanctify-macros = { path = "../../tooling/sanctify-macros" }
+soroban-sdk = "20.5.0"
+```
+
+Then bring the attribute into scope with a `use` import at the top of your contract file:
+
+```rust
+use sanctify_macros::invariant;
+```
+
+---
+
+## Declaring an invariant
+
+Place `#[invariant(expr)]` immediately above `#[contractimpl]`. The expression is any valid Rust expression — typically a call to a pure helper function that returns `bool`. In `contracts/token-invariants/src/lib.rs`:
+
+```rust
+use sanctify_macros::invariant;
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env};
+
+use pure::{burn_pure, mint_pure, transfer_pure};
+
+#[contract]
+pub struct Token;
+
+/// The `#[invariant]` attribute declares that `supply_is_conserved`
+/// must hold across all state transitions. In a normal build the attribute
+/// is transparent — the production binary is unchanged. Under `cargo kani`
+/// it also emits a `#[kani::proof]` harness.
+#[invariant(pure::supply_is_conserved_after_transfer(0, 0, 0))]
+#[contractimpl]
+impl Token {
+    pub fn initialize(env: Env, admin: Address, initial_supply: i128) {
+        if env.storage().instance().has(&ADMIN) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&ADMIN, &admin);
+        env.storage().instance().set(&SUPPLY, &initial_supply);
+        env.storage().persistent().set(&admin, &initial_supply);
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+
+        let bal_from: i128 = env.storage().persistent().get(&from).unwrap_or(0);
+        let bal_to: i128 = env.storage().persistent().get(&to).unwrap_or(0);
+
+        let (new_from, new_to) = transfer_pure(bal_from, bal_to, amount)
+            .expect("transfer failed");
+
+        env.storage().persistent().set(&from, &new_from);
+        env.storage().persistent().set(&to, &new_to);
+    }
+
+    pub fn total_supply(env: Env) -> i128 {
+        env.storage().instance().get(&SUPPLY).unwrap_or(0)
+    }
+}
+```
+
+The expression passed to `#[invariant(...)]` is the pure function that encodes the property. Here, `pure::supply_is_conserved_after_transfer(0, 0, 0)` is the function defined in `contracts/token-invariants/src/pure.rs`:
+
+```rust
+/// Verify the core supply invariant in pure arithmetic:
+/// after any transfer, `from + to` equals the original `from + to`.
+/// Returns `true` when the invariant holds.
+pub fn supply_is_conserved_after_transfer(from: i128, to: i128, amount: i128) -> bool {
+    let original_sum = from.checked_add(to);
+    match transfer_pure(from, to, amount) {
+        Ok((new_from, new_to)) => {
+            let new_sum = new_from.checked_add(new_to);
+            original_sum == new_sum
+        }
+        Err(_) => true, // invalid transfer is a no-op; invariant trivially holds
+    }
+}
+```
+
+---
+
+## What happens in each build mode
+
+<CardGroup cols={2}>
+  <Card title="Normal build" icon="box">
+    The `#[invariant(...)]` attribute is a pass-through. The `impl` block is emitted unchanged. The expression is parsed and stored internally for diagnostic use but **no runtime assertion is injected**. The production WASM binary is bit-for-bit identical to the unannotated version.
+  </Card>
+  <Card title="Kani build (`--cfg kani`)" icon="shield-check">
+    Under `cargo kani`, the macro additionally emits a `#[kani::proof]` harness that calls the invariant expression with symbolic inputs. Kani then formally proves — or refutes — the property for all possible values.
+  </Card>
+</CardGroup>
+
+<Note>
+  No runtime assertion is ever injected into the production binary. Soroban contracts panic on assertion failure and invariant expressions may reference functions only meaningful in a testing context. A future `--runtime-checks` flag will opt in to inline assertions if you want them.
+</Note>
+
+---
+
+## Z3 SMT fast-path
+
+When you run `sanctifier verify`, it first attempts a Z3 SMT fast-path before invoking Kani. The fast-path can prove:
+
+- **Integer equalities** — expressions of the form `a == b` where `a` and `b` are linear combinations of integer literals.
+- **Tautologies** — expressions that are trivially true regardless of input, such as `true` or `x == x`.
+
+Z3 can verify these patterns without needing to know the types or definitions of user-defined functions, making the fast-path safe and extremely fast (microseconds). For expressions involving user-defined functions or more complex properties — like `supply_is_conserved_after_transfer` — the verifier routes to Kani.
+
+This is the same proof-strategy split used in the `contracts/kani-poc` crate, where pure arithmetic harnesses are amenable to SMT reasoning and the contract layer is left unverified.
+
+---
+
+## Using `sanctifier verify`
+
+```bash
+# Verify all invariants in a contract directory
+sanctifier verify ./contracts/token-invariants
+
+# Treat UNKNOWN results as failures (strict mode)
+sanctifier verify ./contracts/token-invariants --strict
+
+# Emit JSON output for CI processing
+sanctifier verify ./contracts/token-invariants --json
+```
+
+### Output states
+
+| Status | Meaning |
+|---|---|
+| `PROVEN` | The Z3 SMT solver proved the invariant holds for all inputs |
+| `REFUTED` | A counterexample was found — the invariant is violated |
+| `UNKNOWN` | The solver hit its time budget without a definitive answer |
+| `KANI ↗` | The invariant requires Kani for a full proof; run `cargo kani` |
+
+A typical `sanctifier verify` run on `contracts/token-invariants` produces output similar to:
+
+```
+Invariant verification — contracts/token-invariants
+────────────────────────────────────────────────────────
+  supply_is_conserved_after_transfer   PROVEN   (Z3, 0.3 ms)
+
+1 invariant verified. 0 refuted. 0 unknown.
+```
+
+---
+
+## Proof harnesses in `contracts/token-invariants`
+
+The `kani_proofs.rs` module in `contracts/token-invariants` ships six harnesses that formally verify the pure arithmetic layer:
+
+```rust
+#[cfg(kani)]
+mod proofs {
+    use crate::pure::*;
+
+    /// Every valid transfer conserves the total of from + to balances.
+    #[kani::proof]
+    fn verify_transfer_conserves_supply() {
+        let from: i128 = kani::any();
+        let to: i128 = kani::any();
+        let amount: i128 = kani::any();
+
+        kani::assume(amount > 0);
+        kani::assume(from >= amount);
+        kani::assume(from <= i128::MAX);
+        kani::assume(to >= 0);
+        kani::assume(to <= i128::MAX - amount);
+        kani::assume(from <= i128::MAX - to);
+
+        assert!(
+            supply_is_conserved_after_transfer(from, to, amount),
+            "supply conservation invariant violated"
+        );
+    }
+
+    /// transfer_pure always fails when amount <= 0.
+    #[kani::proof]
+    fn verify_transfer_rejects_non_positive_amount() {
+        let from: i128 = kani::any();
+        let to: i128 = kani::any();
+        let amount: i128 = kani::any();
+        kani::assume(amount <= 0);
+        assert!(transfer_pure(from, to, amount).is_err());
+    }
+
+    /// transfer_pure fails on sender underflow.
+    #[kani::proof]
+    fn verify_transfer_rejects_underflow() {
+        let from: i128 = kani::any();
+        let to: i128 = kani::any();
+        let amount: i128 = kani::any();
+        kani::assume(amount > 0);
+        kani::assume(from < amount);
+        assert!(transfer_pure(from, to, amount).is_err());
+    }
+
+    /// mint_pure fails when amount <= 0.
+    #[kani::proof]
+    fn verify_mint_rejects_non_positive() {
+        let balance: i128 = kani::any();
+        let amount: i128 = kani::any();
+        kani::assume(amount <= 0);
+        assert!(mint_pure(balance, amount).is_err());
+    }
+
+    /// mint_pure produces balance + amount for valid inputs.
+    #[kani::proof]
+    fn verify_mint_correct_result() {
+        let balance: i128 = kani::any();
+        let amount: i128 = kani::any();
+        kani::assume(amount > 0);
+        kani::assume(balance >= 0);
+        kani::assume(balance <= i128::MAX - amount);
+        let new = mint_pure(balance, amount).expect("mint should succeed");
+        assert_eq!(new, balance + amount);
+    }
+
+    /// burn_pure fails when balance is insufficient.
+    #[kani::proof]
+    fn verify_burn_rejects_insufficient_balance() {
+        let balance: i128 = kani::any();
+        let amount: i128 = kani::any();
+        kani::assume(amount > 0);
+        kani::assume(balance < amount);
+        assert!(burn_pure(balance, amount).is_err());
+    }
+}
+```
+
+Run them with:
+
+```bash
+cargo kani --package token-invariants
+```
+
+---
+
+## Why the production binary is unchanged
+
+The design deliberately avoids injecting any runtime assertion into the production WASM. There are two reasons:
+
+1. **Safety**: Soroban contracts panic on assertion failure, and a panic in production causes the entire transaction to revert. Injecting assertions on invariant expressions — which may call pure testing helpers — would introduce unexpected failure modes in deployed contracts.
+
+2. **Correctness boundary**: The invariant expression is a property about the logic, not the state. It is verified once, statically, by the SMT solver or Kani. Re-evaluating it at runtime every time the function is called would be both expensive and semantically different from what the attribute declares.
+
+If you want runtime enforcement, the `SanctifiedGuard` trait in `sanctifier-core` provides an explicit before/after guard pattern. See the [Runtime Guards](/concepts/runtime-guards) guide for details.

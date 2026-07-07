@@ -1,0 +1,195 @@
+---
+title: "sanctifier diff — Compare Findings Against a Git Reference"
+sidebarTitle: "diff"
+description: "Compare security findings between the current working tree and any git reference to detect regressions and verify fixes in pull requests."
+---
+
+`sanctifier diff` scans both the current working tree and a target git reference, then computes a three-way diff: findings that are **new** (present in the working tree but not in the reference), findings that were **fixed** (present in the reference but no longer in the working tree), and findings that **persist** across both. It is designed as a PR gate — combine it with `--fail-on-new` to automatically block pull requests that introduce new security findings.
+
+## Usage
+
+```bash
+sanctifier diff [OPTIONS] <GIT_REF>
+```
+
+## Arguments and options
+
+<ParamField path="GIT_REF" type="string" required>
+  Git reference to compare against. Accepts any reference that `git rev-parse`
+  can resolve: branch names (`origin/main`), relative refs (`HEAD~1`), tag
+  names, or full commit SHAs.
+</ParamField>
+
+<ParamField query="--path" type="string" default=".">
+  Path to the contract directory or `Cargo.toml`. Both the working-tree scan
+  and the reference scan use this path as their root. Sanctifier checks out the
+  reference to a temporary `git worktree` and analyzes the same relative path
+  within it.
+</ParamField>
+
+<ParamField query="--fail-on-new" type="boolean">
+  Exit with a non-zero status code when any new findings are detected. Without
+  this flag the command always exits `0`. Enable in CI to block merges on
+  regressions.
+</ParamField>
+
+<ParamField query="--format" type="text | json" default="text">
+  Output format. Use `json` for machine-readable diff output suitable for CI
+  artifacts or downstream processing. The branding banner is suppressed in JSON
+  mode.
+</ParamField>
+
+<ParamField query="--vuln-db" type="string">
+  Path to a custom vulnerability database JSON file. Both the working-tree scan
+  and the reference scan use this database, so comparisons are apples-to-apples.
+</ParamField>
+
+## What "new finding" means
+
+A finding is identified by a **fingerprint** composed of its code (e.g. `AUTH_GAP`), its file location, and its message. A finding is considered **new** if its fingerprint appears in the working-tree scan but not in the reference scan. This means:
+
+- A finding moved to a different line number is considered **new** (the old location is **fixed**)
+- Renaming a function that had a finding creates a new finding
+- Reintroducing a previously fixed issue is always detected as new
+
+## Examples
+
+Compare the working tree against `origin/main` and fail if new findings exist:
+
+```bash
+sanctifier diff origin/main --fail-on-new
+```
+
+Compare against the previous commit:
+
+```bash
+sanctifier diff HEAD~1
+```
+
+Compare against a specific commit SHA with JSON output:
+
+```bash
+sanctifier diff a3f8c21 --format json
+```
+
+Compare a specific contract directory against the release branch:
+
+```bash
+sanctifier diff release/v2.0.0 --path ./contracts/token --fail-on-new
+```
+
+## Sample text output
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊  Diff Report: Working Tree vs origin/main
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📈 Summary:
+  ➕ Added:      2
+  ➖ Removed:    1
+  🔄 Persisting: 3
+
+🚨 2 New Findings (Regressions):
+  1. ❌ [AUTH_GAP] CRITICAL
+     Location: src/lib.rs:withdraw
+     Missing authentication in function: withdraw
+
+  2. 🔴 [ARITHMETIC_OVERFLOW] HIGH
+     Location: src/lib.rs:line 102
+     + in calculate_fee: Use checked_add() or saturating_add()
+
+🎉 1 Fixed Findings:
+  1. [S002] src/lib.rs:line 42
+
+🔄 3 Persisting Findings (use JSON format for full list)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️  Review required: New findings detected
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+## JSON diff output structure
+
+```bash
+sanctifier diff HEAD~1 --format json
+```
+
+```json
+{
+  "added": [
+    {
+      "code": "AUTH_GAP",
+      "location": "src/lib.rs:withdraw",
+      "message": "Missing authentication in function: withdraw",
+      "severity": "critical"
+    },
+    {
+      "code": "ARITHMETIC_OVERFLOW",
+      "location": "src/lib.rs:line 102",
+      "message": "+ in calculate_fee: Use checked_add() or saturating_add()",
+      "severity": "high"
+    }
+  ],
+  "removed": [
+    {
+      "code": "PANIC_USAGE",
+      "location": "src/lib.rs:line 42",
+      "message": "unwrap in mint",
+      "severity": "high"
+    }
+  ],
+  "persisting": [
+    {
+      "code": "LEDGER_SIZE_RISK",
+      "location": "src/lib.rs",
+      "message": "LargeState: 68200 bytes",
+      "severity": "medium"
+    }
+  ],
+  "summary": {
+    "added_count": 2,
+    "removed_count": 1,
+    "persisting_count": 3,
+    "has_new_findings": true
+  }
+}
+```
+
+## CI integration: blocking PRs on new findings
+
+Add a step to your GitHub Actions workflow to prevent merging PRs that introduce new security issues:
+
+```yaml
+- name: Sanctifier diff check
+  run: |
+    sanctifier diff origin/${{ github.base_ref }} \
+      --path ./contracts \
+      --fail-on-new \
+      --format json | tee diff-report.json
+```
+
+Upload the diff report as a CI artifact for reviewers:
+
+```yaml
+- name: Upload diff report
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: sanctifier-diff
+    path: diff-report.json
+```
+
+<Info>
+  `sanctifier diff` requires the repository to have git history. It uses
+  `git worktree add --detach` to check out the reference into a temporary
+  directory, runs the analysis there, then removes the worktree. The command
+  will fail with a clear error message if run outside a git repository.
+</Info>
+
+<Tip>
+  For comparing against a baseline of acknowledged findings rather than a git
+  reference, use `sanctifier baseline` combined with `sanctifier analyze`. The
+  `diff` command is specifically for comparing against a prior version of the
+  code — useful in PR review, not for long-term finding suppression.
+</Tip>

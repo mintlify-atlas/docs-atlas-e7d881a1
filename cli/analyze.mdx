@@ -1,0 +1,204 @@
+---
+title: "sanctifier analyze — Scan Contracts for Vulnerabilities"
+sidebarTitle: "analyze"
+description: "Run Sanctifier's full static analysis suite against a Soroban contract directory and emit a human-readable or JSON findings report."
+---
+
+`sanctifier analyze` is the primary command for auditing a Soroban contract. It walks every `.rs` file under the target path and runs the full detection suite: authentication gaps, unchecked arithmetic, explicit panics, ledger-size violations, storage-key collisions, unsafe patterns, event inconsistencies, unhandled `Result` values, upgrade-pattern risks, SMT invariant violations, and built-in CVE database matches. Results are printed to stdout in text or JSON format.
+
+## Usage
+
+```bash
+sanctifier analyze [OPTIONS] [PATH]
+```
+
+## Arguments and options
+
+<ParamField path="PATH" type="string" default=".">
+  Path to the contract directory or `Cargo.toml`. When omitted, Sanctifier
+  analyzes the current working directory. Accepts either a directory or a
+  single `.rs` file.
+</ParamField>
+
+<ParamField query="--format" type="text | json" default="text">
+  Output format. Use `json` to emit a machine-readable report suitable for
+  piping into `sanctifier badge`, CI artifact storage, or custom tooling. The
+  branding banner is suppressed in JSON mode.
+</ParamField>
+
+<ParamField query="--limit" type="number" default="64000">
+  Maximum ledger-entry size in bytes. Findings with severity `ExceedsLimit` are
+  reported as **high**; findings that merely approach the limit are **low**.
+  Override this when your Soroban network has a different configured limit.
+</ParamField>
+
+<ParamField query="--vuln-db" type="string">
+  Path to a custom vulnerability database JSON file. When provided, Sanctifier
+  uses this database instead of (not in addition to) the built-in one. Useful
+  for internal security teams who maintain a proprietary CVE catalog.
+</ParamField>
+
+<ParamField query="--webhook-url" type="string">
+  Webhook endpoint to notify when the scan completes. Can be supplied multiple
+  times. Supports Discord, Slack, Teams, and any endpoint that accepts a JSON
+  `POST`. The payload includes a `summary` object with `total_findings`,
+  `has_critical`, and `has_high` fields.
+</ParamField>
+
+<ParamField query="--no-baseline" type="boolean">
+  When present, Sanctifier ignores `.sanctify-baseline.json` and reports every
+  finding, including ones that have already been acknowledged. Use this in
+  security audits or when you want a clean, unfiltered view.
+</ParamField>
+
+## Sample terminal output
+
+```
+✨ Sanctifier: Valid Soroban project found at "./contracts/my-token"
+🔍 Analyzing contract at "./contracts/my-token"...
+📦 Loading built-in vulnerability database (v1.0.0)
+
+⚠️  Found potential Authentication Gaps!
+   -> [S001] Function: src/lib.rs:transfer
+
+⚠️  Found explicit Panics/Unwraps!
+   -> [S002] Type: unwrap
+      Location: src/lib.rs:line 42
+
+⚠️  Found unchecked Arithmetic Operations!
+   -> [S003] Op: +
+      Location: src/lib.rs:line 88
+
+⚠️  Found Ledger Size Warnings!
+   -> [S004] Struct: LargeState
+      Size: 68200 bytes
+
+✅ No storage key collisions found.
+✅ No known vulnerability patterns matched (DB v1.0.0).
+
+✨ Static analysis complete.
+```
+
+## JSON output structure
+
+Pass `--format json` to receive a structured report:
+
+```bash
+sanctifier analyze . --format json > sanctifier-report.json
+```
+
+The report includes a `summary` object, per-category `findings` arrays, `baseline` suppression metadata, and an `error_codes` mapping:
+
+```json
+{
+  "metadata": {
+    "version": "0.1.0",
+    "timestamp": "1718000000",
+    "project_path": ".",
+    "format": "sanctifier-ci-v1"
+  },
+  "summary": {
+    "total_findings": 3,
+    "auth_gaps": 1,
+    "panic_issues": 1,
+    "arithmetic_issues": 1,
+    "size_warnings": 0,
+    "storage_collisions": 0,
+    "unsafe_patterns": 0,
+    "custom_rule_matches": 0,
+    "event_issues": 0,
+    "unhandled_results": 0,
+    "smt_issues": 0,
+    "has_critical": true,
+    "has_high": true
+  },
+  "findings": {
+    "auth_gaps": [
+      { "code": "S001", "function": "src/lib.rs:transfer" }
+    ],
+    "panic_issues": [
+      {
+        "code": "S002",
+        "function_name": "mint",
+        "issue_type": "unwrap",
+        "location": "src/lib.rs:line 42"
+      }
+    ],
+    "arithmetic_issues": [
+      {
+        "code": "S003",
+        "function_name": "compound_interest",
+        "operation": "+",
+        "suggestion": "Use checked_add() or saturating_add()",
+        "location": "src/lib.rs:line 88"
+      }
+    ]
+  },
+  "baseline": {
+    "suppressed_count": 0,
+    "stale_entries": []
+  },
+  "vulnerability_db_matches": [],
+  "vulnerability_db_version": "1.0.0"
+}
+```
+
+<Note>
+  The analyzer exits with status code `1` when critical or high findings are
+  detected. This makes `sanctifier analyze` suitable as a blocking CI step
+  without any extra scripting.
+</Note>
+
+## Webhook notifications
+
+Notify a Slack channel and a Discord channel simultaneously when a scan finishes:
+
+```bash
+sanctifier analyze ./contracts/token \
+  --webhook-url https://hooks.slack.com/services/XXX/YYY/ZZZ \
+  --webhook-url https://discord.com/api/webhooks/ID/TOKEN
+```
+
+The webhook `POST` body:
+
+```json
+{
+  "event": "scan.completed",
+  "project_path": "./contracts/token",
+  "timestamp_unix": "1718000000",
+  "summary": {
+    "total_findings": 3,
+    "has_critical": true,
+    "has_high": true
+  }
+}
+```
+
+## Baseline integration
+
+By default `sanctifier analyze` reads `.sanctify-baseline.json` (if it exists) and suppresses any finding already recorded there. Only findings that are **new** since the baseline was taken are shown:
+
+```
+ℹ️  2 findings suppressed by baseline (run sanctifier analyze --no-baseline to see all)
+```
+
+Use `--no-baseline` to bypass suppression and see the complete picture:
+
+```bash
+sanctifier analyze . --no-baseline
+```
+
+To record the current findings as the new baseline, use [`sanctifier baseline`](/cli/baseline). To refresh the baseline after intentionally fixing or accepting issues, use `sanctifier baseline --update`.
+
+## Custom vulnerability database
+
+Point `--vuln-db` at a JSON file that conforms to the built-in database schema to scan against a private CVE catalog:
+
+```bash
+sanctifier analyze . --vuln-db ./security/internal-vulns.json
+```
+
+<Tip>
+  Export the built-in database with `sanctifier cve export --format json -o
+  builtin-vulns.json` to use it as a template for your own database.
+</Tip>

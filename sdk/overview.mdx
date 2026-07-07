@@ -1,0 +1,226 @@
+---
+title: "@sanctifier/sdk: Soroban Security Analysis in JavaScript"
+sidebarTitle: "Overview"
+description: "TypeScript/JavaScript SDK wrapping the Sanctifier WASM core — run the full Soroban security rule set in Node.js, browsers, and serverless runtimes."
+---
+
+`@sanctifier/sdk` brings the full Sanctifier analysis engine to every JavaScript environment. It packages the same `sanctifier-core` rules — authentication gaps, unsafe arithmetic, storage collisions, upgrade risks, and more — compiled to WebAssembly, so you can audit Soroban source code from a Node.js script, a browser playground, a VS Code extension, or a serverless edge function without installing or spawning a Rust binary.
+
+## Installation
+
+Version `0.1.0` is available on the npm registry under the `@sanctifier` scope.
+
+<CodeGroup>
+```bash npm
+npm install @sanctifier/sdk
+```
+```bash yarn
+yarn add @sanctifier/sdk
+```
+```bash pnpm
+pnpm add @sanctifier/sdk
+```
+</CodeGroup>
+
+## Exported functions
+
+The package surface is intentionally small. Four functions cover every use case:
+
+```typescript
+import { analyze, findingCodes, coreVersion, init } from "@sanctifier/sdk";
+
+// Analyze a Soroban contract source string and return a structured report.
+analyze(source: string, options?: AnalyzeOptions): Promise<AnalysisReport>
+
+// Return the full catalog of stable finding codes with descriptions.
+findingCodes(): FindingCodeEntry[]
+
+// Return the semver of the sanctifier-core WASM bundle.
+coreVersion(): string
+
+// Load and instantiate the WASM module (required in browsers; no-op in Node).
+init(input?: unknown): Promise<void>
+```
+
+<Note>
+  `analyzeSync` is also exported from `@sanctifier/sdk/node` for CLI scripts
+  that prefer a synchronous call. It is not available in the browser entry.
+</Note>
+
+## Quick start
+
+The example below reads a Soroban contract source string, runs the full rule set, and prints each finding to the console.
+
+```typescript
+import { analyze, SanctifierError } from "@sanctifier/sdk";
+import { readFile } from "node:fs/promises";
+
+const source = await readFile("contracts/token.rs", "utf8");
+
+try {
+  const report = await analyze(source, { failOn: "high" });
+
+  console.log(`Analysis complete. ${report.summary.total} finding(s) found.`);
+  console.log(
+    `  critical: ${report.summary.critical}  high: ${report.summary.high}` +
+    `  medium: ${report.summary.medium}  low: ${report.summary.low}` +
+    `  info: ${report.summary.info}`
+  );
+
+  for (const finding of report.findings) {
+    const loc = finding.line != null ? `:${finding.line}` : "";
+    console.log(`[${finding.severity.toUpperCase()}] ${finding.code} ${finding.location}${loc}`);
+    console.log(`  ${finding.message}`);
+  }
+} catch (err) {
+  if (err instanceof SanctifierError) {
+    console.error(
+      `Sanctifier flagged ${err.report.summary.total} issue(s) ` +
+      `at or above the '${err.threshold}' threshold.`
+    );
+    process.exit(1);
+  }
+  throw err;
+}
+```
+
+## `AnalyzeOptions`
+
+Pass an optional second argument to `analyze()` to control rule execution and failure behaviour.
+
+<ParamField body="failOn" type='"info" | "low" | "medium" | "high" | "critical"'>
+  When set, `analyze()` rejects with a `SanctifierError` if any finding has a severity
+  at or above this threshold. The error carries the full `AnalysisReport` so you can
+  render details after catching. Omit to receive findings without throwing.
+</ParamField>
+
+<ParamField body="ledgerLimit" type="number">
+  Override the ledger entry byte budget used by the storage-size checks (S004).
+  Defaults to the Soroban protocol limit baked into the WASM bundle.
+</ParamField>
+
+<ParamField body="approachingThreshold" type="number">
+  Fraction of `ledgerLimit` (between 0 and 1) at which a struct is considered to
+  be "approaching" the limit and triggers a warning instead of an error.
+  Defaults to `0.8`.
+</ParamField>
+
+<ParamField body="enabledRules" type="string[]">
+  Restrict analysis to the named rules. Pass stable code strings such as
+  `["S001", "S003"]` or the rule name identifiers accepted by the core.
+  When omitted, all built-in rules run.
+</ParamField>
+
+<ParamField body="ignorePaths" type="string[]">
+  Glob patterns passed to the core for paths that custom regex rules should skip.
+  Has no effect on the built-in structural rules.
+</ParamField>
+
+<ParamField body="customRules" type="CustomRule[]">
+  One or more user-defined regex rules. Each match is surfaced as a finding with
+  code `S007`. See the `CustomRule` type below.
+
+  ```typescript
+  interface CustomRule {
+    name: string;     // Unique rule identifier shown in findings
+    pattern: string;  // Regular expression matched against the source text
+    severity?: "info" | "warning" | "error"; // Defaults to "warning"
+  }
+  ```
+</ParamField>
+
+## `AnalysisReport`
+
+Every successful call to `analyze()` resolves with an `AnalysisReport`.
+
+```typescript
+interface AnalysisReport {
+  findings: Finding[];
+  summary: SeveritySummary;
+  raw: RawReport;
+}
+```
+
+### `findings`
+
+A flat list of every issue discovered across all rules.
+
+```typescript
+interface Finding {
+  code: FindingCode;          // Stable code, e.g. "S001"
+  category: string;           // e.g. "authentication", "arithmetic"
+  severity: Severity;         // "info" | "low" | "medium" | "high" | "critical"
+  message: string;            // Human-readable description of the problem
+  location: string;           // File / scope path, e.g. "Token::transfer"
+  function_name: string | null; // Enclosing function, when identifiable
+  line: number | null;        // Source line, when identifiable
+}
+```
+
+### `summary`
+
+Aggregated counts across all severity levels. `total` equals `findings.length`.
+
+```typescript
+interface SeveritySummary {
+  total: number;
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  info: number;
+}
+```
+
+### `raw`
+
+The original per-category vectors returned by the WASM core. Useful when you need
+finer-grained access beyond the normalised `findings` list.
+
+```typescript
+interface RawReport {
+  size_warnings: SizeWarning[];
+  unsafe_patterns: UnsafePattern[];
+  auth_gaps: string[];
+  panic_issues: PanicIssue[];
+  arithmetic_issues: ArithmeticIssue[];
+  storage_collisions: StorageCollisionIssue[];
+  unhandled_results: UnhandledResultIssue[];
+  event_issues: EventIssue[];
+  upgrade_report: UpgradeReport;
+  custom_rule_matches: CustomRuleMatch[];
+}
+```
+
+## `FindingCodeEntry`
+
+`findingCodes()` returns an array of these records — one per stable code in the
+`sanctifier-core` catalog.
+
+```typescript
+interface FindingCodeEntry {
+  code: string;        // e.g. "S001"
+  category: string;    // e.g. "authentication"
+  description: string; // Human-readable summary of what the rule detects
+}
+```
+
+## `SanctifierError`
+
+Thrown (or rejected) when `failOn` is set and at least one finding meets the
+threshold.
+
+```typescript
+class SanctifierError extends Error {
+  readonly report: AnalysisReport; // Full report, available after catching
+  readonly threshold: Severity;    // The failOn value that was breached
+}
+```
+
+## Environment-specific guides
+
+The public API — types, function signatures, import paths — is identical in Node.js
+and browsers. Only initialisation differs.
+
+- [Node.js guide →](/sdk/node) — zero-config usage, `analyzeSync`, CJS vs ESM exports
+- [Browser guide →](/sdk/browser) — WASM initialisation, bundler setup, React snippet

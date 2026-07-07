@@ -1,72 +1,97 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "Sanctifier",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#040404",
+    "light": "#7c7c7c",
+    "dark": "#cccccc"
   },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
+  "favicon": "https://media.brand.dev/dd537820-cef7-49b3-88c7-ae55b1ec78f1.png",
   "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "light": "https://media.brand.dev/40169ba6-1071-44f8-a82f-2c1ea6b94873.svg",
+    "dark": "https://media.brand.dev/40169ba6-1071-44f8-a82f-2c1ea6b94873.svg"
   },
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/Centurylong/sanctifier"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/Centurylong/sanctifier"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/static-analysis",
+              "concepts/runtime-guards",
+              "concepts/formal-verification",
+              "concepts/finding-codes"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/configuration",
+              "guides/ci-cd",
+              "guides/kani-integration",
+              "guides/invariant-dsl",
+              "guides/soroban-deployment"
+            ]
+          },
+          {
+            "group": "SDK",
+            "pages": [
+              "sdk/overview",
+              "sdk/node",
+              "sdk/browser"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/vulnerability-database",
+              "reference/contracts",
+              "reference/faq"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "CLI Reference",
+        "groups": [
+          {
+            "group": "Commands",
+            "pages": [
+              "cli/overview",
+              "cli/analyze",
+              "cli/verify",
+              "cli/prove",
+              "cli/baseline",
+              "cli/diff",
+              "cli/attest",
+              "cli/cve",
+              "cli/other-commands"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

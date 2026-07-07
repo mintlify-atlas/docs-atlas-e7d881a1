@@ -1,0 +1,160 @@
+---
+title: "sanctifier attest — Zero-Knowledge Security Attestation"
+sidebarTitle: "attest"
+description: "Generate a cryptographic zero-knowledge proof that a Soroban contract passed a security score threshold, or verify an existing attestation artifact."
+---
+
+`sanctifier attest` generates a cryptographic attestation that a contract scan passed a minimum security score threshold — without revealing the exact score or the full findings report. The proof is built on Bulletproofs range proofs (no trusted setup required) and is bound to the precise scanner version, vulnerability ruleset, and source code that was analyzed. A third party can verify the attestation with nothing more than the artifact file and the `sanctifier` binary.
+
+## Usage
+
+```bash
+# Generate an attestation
+sanctifier attest [OPTIONS] [PATH]
+
+# Verify an existing attestation
+sanctifier attest --verify <FILE>
+```
+
+## Arguments and options
+
+<ParamField path="PATH" type="string" default=".">
+  Path to the contract directory or a single `.rs` file to scan and attest.
+  Ignored when `--verify` is provided.
+</ParamField>
+
+<ParamField query="--threshold" type="number" default="90">
+  Minimum security score (0–100) the scan must reach to produce an
+  attestation. The score is computed by penalizing findings by severity:
+  critical findings cost 40 points each, high findings cost 15, medium cost 6,
+  and low cost 2. A clean scan (no findings) scores 100.
+
+  If the scan falls below the threshold, Sanctifier exits with code `1` and
+  writes no artifact.
+</ParamField>
+
+<ParamField query="--out" type="string">
+  Write the attestation artifact to this file path. When omitted the artifact
+  is printed to stdout as JSON.
+</ParamField>
+
+<ParamField query="--verify" type="string">
+  Path to an existing attestation artifact file. When this flag is present,
+  Sanctifier verifies the artifact instead of generating one — no scan is run.
+  The verifier recomputes the statement binding from the artifact's own
+  metadata and checks the Bulletproofs range proof against the recorded
+  commitment.
+</ParamField>
+
+## How zero-knowledge attestation works
+
+The statement Sanctifier proves is: **"the (hidden) security score is at least the public threshold"**, bound to the exact scanner version, ruleset, and source under analysis.
+
+<Steps>
+  <Step title="Score the scan">
+    Sanctifier runs the full analysis suite and computes a 0–100 security
+    score. The source files are hashed into a SHA-256 `source_commitment` that
+    binds the attestation to precisely the code that was scanned.
+  </Step>
+  <Step title="Build the statement binding">
+    A binding is computed over `scanner_version || ruleset || source_commitment
+    || threshold`. This ensures a proof generated for one scan cannot be
+    replayed against a different scanner version, ruleset, or threshold.
+  </Step>
+  <Step title="Generate the range proof">
+    A Bulletproofs range proof is generated over `delta = score - threshold`.
+    The Pedersen commitment hides `delta` (and therefore the exact score) — the
+    verifier learns only that the threshold was cleared, not by how much.
+  </Step>
+  <Step title="Self-verify and emit">
+    Sanctifier verifies the proof against itself before writing the artifact.
+    If the self-verification fails the tool panics with an internal error rather
+    than emitting a potentially invalid artifact.
+  </Step>
+</Steps>
+
+## Generating an attestation
+
+```bash
+sanctifier attest . --threshold 90 --out attest.json
+```
+
+```
+🔍 Scanned 12 file(s) — 0 finding(s) [critical: 0, high: 0, medium: 0, low: 0]; attesting against threshold 90.
+✅ Attestation written to attest.json (score ≥ 90, proven in zero knowledge).
+```
+
+## Verifying an attestation
+
+```bash
+sanctifier attest --verify attest.json
+```
+
+```
+✅ Attestation valid: proven that the security score is ≥ 90 for <source_commitment> (ruleset builtin-vulndb@1.0.0).
+```
+
+## Attestation artifact structure
+
+```json
+{
+  "version": "sanctifier-attestation-v1",
+  "proof": {
+    "system": "bulletproofs-rangeproof",
+    "range_bits": 16,
+    "proof": "a1b2c3d4..."
+  },
+  "public_inputs": {
+    "score_commitment": "e5f6a7b8...",
+    "threshold": 90,
+    "statement_binding": "deadbeef..."
+  },
+  "meta": {
+    "scanner": "sanctifier",
+    "scanner_version": "0.1.0",
+    "ruleset": "builtin-vulndb@1.0.0",
+    "source_commitment": "3c4d5e6f...",
+    "files_analyzed": 12,
+    "result": "pass",
+    "claim": "security score >= threshold",
+    "generated_at_unix": 1718000000
+  },
+  "verification": {
+    "instructions": "Recompute the statement binding from meta (scanner_version, ruleset, source_commitment, threshold), then verify the Bulletproofs range proof against score_commitment. Locally: `sanctifier attest --verify <file>`.",
+    "command": "sanctifier attest --verify attestation.json"
+  }
+}
+```
+
+<Note>
+  The exact score and per-severity finding counts are intentionally **not**
+  included in the artifact. The verifier learns only that `score >= threshold`,
+  which is the zero-knowledge property: compliance is proven without disclosing
+  internal audit details.
+</Note>
+
+## Use cases
+
+| Use case | How to use |
+|---|---|
+| Publish proof of compliance without revealing full findings | Generate with `--out attest.json`, share the file |
+| Third-party audit verification | Share the artifact; auditor runs `sanctifier attest --verify` |
+| CI gate: block deploys below a score threshold | `sanctifier attest . --threshold 85` — exits `1` if score is below 85 |
+| DeFi protocol partner due diligence | Provide an attestation artifact for each contract version |
+
+## Relationship to the Sanctity Score
+
+The Sanctity Score (0–100) is the numerical value that the attestation proves a lower bound on. The scoring formula is:
+
+```
+score = max(0, 100 - (critical × 40) - (high × 15) - (medium × 6) - (low × 2))
+```
+
+A contract with no findings scores 100. Each critical finding costs 40 points, so two critical findings alone can reduce a perfect score to 20.
+
+<Warning>
+  An attestation is only as trustworthy as the scanner that produced it. The
+  artifact records the exact `scanner_version` and `ruleset` used. Verifiers
+  should check that they trust the named scanner version before relying on the
+  proof.
+</Warning>

@@ -1,0 +1,172 @@
+---
+title: "sanctifier verify — Check #[sanctify::invariant] Declarations"
+sidebarTitle: "verify"
+description: "Discover every #[sanctify::invariant] attribute in a Soroban workspace and attempt to prove, refute, or dispatch each one using the Z3 SMT solver."
+---
+
+`sanctifier verify` scans a contract directory or workspace for functions annotated with `#[sanctify::invariant]` and attempts to verify each one using the built-in Z3 SMT solver. Each invariant receives one of four statuses — **PROVEN**, **REFUTED**, **UNKNOWN**, or **KANI ↗** — which are printed in a color-coded table. The command is designed to slot into CI pipelines via the `--strict` flag.
+
+## Usage
+
+```bash
+sanctifier verify [OPTIONS] [PATH]
+```
+
+## Arguments and options
+
+<ParamField path="PATH" type="string" default=".">
+  Path to a contract directory, workspace directory, or a single `.rs` file.
+  Sanctifier recursively discovers all `.rs` files, skipping paths listed in
+  `.sanctify.toml`'s `ignore_paths` (e.g. `target`, `.git`).
+</ParamField>
+
+<ParamField query="--strict" type="boolean" default="false">
+  Exit with a non-zero status code if any invariant is **Refuted** or
+  **Unknown**. Without this flag the command always exits `0`, which is useful
+  for informational runs. Enable `--strict` in CI to block merges when
+  invariants cannot be proven.
+</ParamField>
+
+<ParamField query="--json" type="boolean" default="false">
+  Emit results as a JSON array instead of the human-readable colored table.
+  Each element contains `contract`, `invariant`, `location`, and `result`
+  fields.
+</ParamField>
+
+<ParamField query="--quiet" type="boolean" default="false">
+  Suppress the summary line (`N proven  N refuted  N dispatched to Kani`) at
+  the end of human-readable output. Individual invariant results are still
+  printed.
+</ParamField>
+
+## The four output states
+
+| Status | Color | Meaning |
+|---|---|---|
+| **PROVEN** | Green | The Z3 solver confirmed the invariant holds for all possible inputs |
+| **REFUTED** | Red | The solver found a concrete counterexample that violates the invariant |
+| **UNKNOWN** | Yellow | The solver timed out or could not determine satisfiability |
+| **KANI ↗** | Blue | The invariant requires Kani for bounded model checking; a `cargo kani` command is printed |
+
+## Annotating invariants
+
+Decorate a function with `#[sanctify::invariant]` to register it for verification:
+
+```rust
+use soroban_sdk::{contract, contractimpl, Env};
+
+#[contract]
+pub struct Token;
+
+#[contractimpl]
+impl Token {
+    /// Total supply must never be negative.
+    #[sanctify::invariant]
+    pub fn supply_is_non_negative(env: Env) -> bool {
+        let supply: i128 = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, "SUPPLY"))
+            .unwrap_or(0);
+        supply >= 0
+    }
+}
+```
+
+Running `sanctifier verify` will discover and attempt to prove this invariant automatically.
+
+## Sample text output
+
+```
+─── sanctifier verify ───────────────────────────────
+
+  PROVEN   Token :: supply_is_non_negative
+           src/lib.rs:line 14
+
+  REFUTED  Token :: allowance_fits_in_i128
+           src/lib.rs:line 28
+           counterexample: amount = 9223372036854775808
+
+  KANI ↗   Token :: no_reentrancy
+           src/lib.rs:line 45
+           → run: cargo kani --target-dir /tmp/kani
+
+Summary: 1 proven  1 refuted  1 dispatched to Kani
+```
+
+## JSON output
+
+```bash
+sanctifier verify . --json
+```
+
+```json
+[
+  {
+    "contract": "Token",
+    "invariant": "supply_is_non_negative",
+    "location": "src/lib.rs:line 14",
+    "result": "Proven"
+  },
+  {
+    "contract": "Token",
+    "invariant": "allowance_fits_in_i128",
+    "location": "src/lib.rs:line 28",
+    "result": {
+      "Refuted": {
+        "counterexample": "amount = 9223372036854775808"
+      }
+    }
+  },
+  {
+    "contract": "Token",
+    "invariant": "no_reentrancy",
+    "location": "src/lib.rs:line 45",
+    "result": "Unsupported"
+  }
+]
+```
+
+## CI integration with --strict
+
+Add `sanctifier verify` to your CI pipeline to block merges that introduce refuted invariants:
+
+```bash
+sanctifier verify . --strict
+```
+
+When any invariant is **Refuted** or **Unknown**, the command exits with code `1`. Use `--json` together with `--strict` to feed structured results into downstream reporting tools:
+
+```bash
+sanctifier verify . --strict --json | tee verify-results.json
+```
+
+<Warning>
+  `--strict` treats **Unknown** (solver timeout) as a failure in addition to
+  **Refuted**. If you are running on resource-constrained CI agents, consider
+  using `--strict` only on `REFUTED` results by checking the JSON output
+  directly rather than relying on the exit code.
+</Warning>
+
+## What Z3 can and cannot prove
+
+The Z3 SMT verifier used by Sanctifier reasons about arithmetic, logical, and comparison expressions symbolically. It can prove invariants involving:
+
+- Integer bounds (`balance >= 0`, `supply <= MAX_SUPPLY`)
+- Arithmetic identities (`a + b == b + a`)
+- Boolean preconditions over known-type inputs
+
+It **cannot** prove invariants that require:
+
+- Cross-transaction state reasoning (state is not carried between calls in the SMT encoding)
+- Properties over unbounded loops or recursive data structures
+- Assertions that depend on external contract calls
+
+For those cases the verifier returns **KANI ↗** and recommends running [Kani](https://model-checking.github.io/kani/) for bounded model checking.
+
+<Tip>
+  Use `sanctifier prove` for formal verification of well-known token-contract
+  invariants (`balance_non_negative`, `supply_conserved`,
+  `no_unauthorized_mint`) — it runs a deeper SMT proof and saves a proof
+  certificate to disk.
+</Tip>

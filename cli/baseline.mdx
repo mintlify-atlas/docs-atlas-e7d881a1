@@ -1,0 +1,158 @@
+---
+title: "sanctifier baseline — Snapshot and Track Findings"
+sidebarTitle: "baseline"
+description: "Snapshot the current set of findings into .sanctify-baseline.json so that future sanctifier analyze runs surface only new, unacknowledged issues."
+---
+
+`sanctifier baseline` runs the full analysis suite against a contract path and saves the results to `.sanctify-baseline.json`. Once a baseline exists, subsequent `sanctifier analyze` runs automatically suppress any finding that was already present when the baseline was taken — only genuinely new findings are shown. This workflow lets teams acknowledge existing technical debt without having CI fail on every run, while still catching regressions immediately.
+
+## Usage
+
+```bash
+sanctifier baseline [OPTIONS] [PATH]
+```
+
+## Arguments and options
+
+<ParamField path="PATH" type="string" default=".">
+  Path to the contract directory, workspace root, or a single `.rs` file.
+  Sanctifier writes `.sanctify-baseline.json` to the project root (the
+  directory containing `Cargo.toml`, or the parent directory when a `.rs` file
+  is given).
+</ParamField>
+
+<ParamField query="--update" type="boolean">
+  Overwrite an existing `.sanctify-baseline.json`. Without this flag, running
+  `sanctifier baseline` when a baseline already exists prints an error and
+  exits with code `1`. Use `--update` after intentionally fixing or accepting
+  findings to refresh the baseline.
+</ParamField>
+
+<ParamField query="--quiet" type="boolean">
+  Suppress all output except the path of the written file. Useful in CI
+  pipelines where you want to capture the artifact path without noise.
+</ParamField>
+
+## The .sanctify-baseline.json file
+
+The baseline file is a JSON array of finding fingerprints. Each entry records enough information to uniquely identify a finding without being so tightly coupled to line numbers that a pure reformatting would mark it as new:
+
+```json
+[
+  {
+    "fingerprint": "S001:src/lib.rs:transfer:transfer",
+    "code": "S001",
+    "path": "src/lib.rs:transfer",
+    "context": "transfer"
+  },
+  {
+    "fingerprint": "S003:src/lib.rs:line 88:compound_interest|+",
+    "code": "S003",
+    "path": "src/lib.rs:line 88",
+    "context": "compound_interest|+"
+  }
+]
+```
+
+Commit `.sanctify-baseline.json` to version control. The file is stable across re-runs on the same code: the fingerprinting algorithm is deterministic.
+
+## Workflow
+
+<Steps>
+  <Step title="Take the initial baseline">
+    On a new project (or when adopting Sanctifier on an existing one), snapshot
+    all current findings:
+
+    ```bash
+    sanctifier baseline .
+    ```
+
+    ```
+    🔍 Running analysis to collect current findings…
+    ✅ Wrote 5 findings to .sanctify-baseline.json
+        Future sanctifier analyze runs will suppress these and only report new ones.
+    ```
+  </Step>
+
+  <Step title="Commit the baseline">
+    Add the baseline file to version control so all team members and CI share
+    the same suppression state:
+
+    ```bash
+    git add .sanctify-baseline.json
+    git commit -m "chore: add sanctifier baseline"
+    ```
+  </Step>
+
+  <Step title="Run ongoing scans">
+    Every `sanctifier analyze` now filters out the baselined findings
+    automatically:
+
+    ```
+    ℹ️  5 findings suppressed by baseline (run sanctifier analyze --no-baseline to see all)
+    ✅ Static analysis complete.
+    ```
+
+    Only findings introduced after the baseline was taken will be reported.
+  </Step>
+
+  <Step title="Refresh the baseline after intentional changes">
+    After fixing or explicitly accepting existing findings, update the baseline
+    to reflect the new clean state:
+
+    ```bash
+    sanctifier baseline --update .
+    ```
+
+    ```
+    🔍 Running analysis to collect current findings…
+    ✅ Wrote 2 findings to .sanctify-baseline.json
+        Future sanctifier analyze runs will suppress these and only report new ones.
+    ```
+  </Step>
+</Steps>
+
+## Stale baseline entries
+
+When a baselined finding no longer appears in the codebase (because it was fixed), `sanctifier analyze` reports it as stale:
+
+```
+ℹ️  1 stale baseline entry (no longer present in the codebase):
+   ~ [S001] src/lib.rs:transfer — transfer
+    Run sanctifier baseline --update to remove them.
+```
+
+Run `sanctifier baseline --update` to remove stale entries and keep the baseline lean.
+
+## CI usage with --quiet
+
+In a CI pipeline where you want to capture the path of the baseline file:
+
+```bash
+BASELINE=$(sanctifier baseline --quiet .)
+echo "Baseline written to $BASELINE"
+```
+
+## Relationship with sanctifier analyze --no-baseline
+
+The `--no-baseline` flag on `sanctifier analyze` is the escape hatch: it ignores the baseline entirely and reports all findings, including acknowledged ones. Use it for:
+
+- Full security audits where you want an unfiltered view
+- Verifying that a suppressed finding has actually been fixed
+- Generating a complete JSON report for archival
+
+```bash
+# Full unfiltered scan
+sanctifier analyze . --no-baseline
+
+# Full unfiltered JSON report
+sanctifier analyze . --no-baseline --format json > full-report.json
+```
+
+<Warning>
+  Never use `sanctifier baseline` as a way to permanently silence critical
+  findings without fixing them. The baseline is intended to suppress
+  pre-existing technical debt during a migration period, not to hide ongoing
+  security issues. Review the baseline file in code review the same way you
+  would review a `// TODO` comment.
+</Warning>

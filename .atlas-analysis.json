@@ -1,0 +1,118 @@
+{
+  "projectType": "cli-tool",
+  "projectName": "Sanctifier",
+  "projectDescription": "A comprehensive Rust-based security and formal verification suite for Stellar Soroban smart contracts, offering static analysis, runtime guards, SMT-based proof, Kani integration, and a TypeScript SDK.",
+  "theme": "aspen",
+  "primaryColor": "#040404",
+  "lightColor": "#7c7c7c",
+  "darkColor": "#cccccc",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/static-analysis",
+              "concepts/runtime-guards",
+              "concepts/formal-verification",
+              "concepts/finding-codes"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/configuration",
+              "guides/ci-cd",
+              "guides/kani-integration",
+              "guides/invariant-dsl",
+              "guides/soroban-deployment"
+            ]
+          },
+          {
+            "group": "SDK",
+            "pages": [
+              "sdk/overview",
+              "sdk/node",
+              "sdk/browser"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/vulnerability-database",
+              "reference/contracts",
+              "reference/faq"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "CLI Reference",
+        "groups": [
+          {
+            "group": "Commands",
+            "pages": [
+              "cli/overview",
+              "cli/analyze",
+              "cli/verify",
+              "cli/prove",
+              "cli/baseline",
+              "cli/diff",
+              "cli/attest",
+              "cli/cve",
+              "cli/other-commands"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Static analysis for Soroban contracts (auth gaps, arithmetic overflow, storage collisions, panic handling)",
+    "Runtime guard macros (`guard_invariant!`) that emit on-chain audit events before trapping",
+    "SMT-based formal verification of token invariants via Z3",
+    "Kani Rust Verifier integration for pure-function proof harnesses",
+    "`#[sanctify::invariant]` proc-macro that auto-generates Kani proof harnesses",
+    "Zero-knowledge attestation (`sanctifier attest`) proving a scan passed a score threshold",
+    "Soroban/Stellar CVE database with search, filter, export, and local HTTP server",
+    "TypeScript/JavaScript SDK (`@sanctifier/sdk`) wrapping the WASM core for Node and browser",
+    "VS Code extension for inline analysis and findings highlighting",
+    "Diff-based regression tracking (`sanctifier diff`) and baseline management",
+    "Dynamic security badge generation for README shields",
+    "CI/CD GitHub Actions workflows for automated deployment and monitoring"
+  ],
+  "publicApiSurface": [
+    "sanctifier analyze [PATH] [--format text|json] [--webhook-url URL]",
+    "sanctifier verify [PATH] [--strict] [--json]",
+    "sanctifier prove --invariant <balance_non_negative|supply_conserved|no_unauthorized_mint|all>",
+    "sanctifier baseline [PATH] [--update] [--quiet]",
+    "sanctifier diff <GIT_REF> [--fail-on-new] [--format text|json]",
+    "sanctifier attest [PATH] [--threshold N] [--out FILE] [--verify FILE]",
+    "sanctifier badge [--report FILE] [--svg-output FILE] [--markdown-output FILE]",
+    "sanctifier cve search --keyword <KEYWORD>",
+    "sanctifier cve list [-c CATEGORY] [-s SEVERITY]",
+    "sanctifier cve show <ID>",
+    "sanctifier cve export [--format json|rss]",
+    "sanctifier cve serve [--port PORT]",
+    "sanctifier callgraph [PATH] [--output FILE]",
+    "sanctifier init [--force]",
+    "sanctifier watch [--path PATH] [--debounce MS]",
+    "sanctifier update",
+    "@sanctifier/sdk: analyze(source, options?) => Promise<AnalysisReport>",
+    "@sanctifier/sdk: findingCodes() => FindingCodeEntry[]",
+    "@sanctifier/sdk: coreVersion() => string",
+    "@sanctifier/sdk: init(input?) => Promise<void>",
+    "sanctifier_guards::guard_invariant!(env, cond, Error::X)",
+    "#[sanctify::invariant(expr)] proc-macro attribute"
+  ]
+}

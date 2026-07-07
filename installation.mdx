@@ -1,0 +1,230 @@
+---
+title: "Install Sanctifier CLI and Dependencies"
+sidebarTitle: "Installation"
+description: "Install the Sanctifier CLI via Cargo or Docker, set up required dependencies, and configure optional formal-verification tools like Kani and Z3."
+---
+
+Sanctifier ships as a single Rust binary called `sanctifier`. The primary distribution channel is Cargo (building from source), which gives you the full CLI on any platform with a working Rust toolchain. A Docker image is also available for environments where installing Rust is impractical, such as ephemeral CI runners.
+
+## Prerequisites
+
+### Rust toolchain
+
+Sanctifier is written in Rust and requires **Rust 1.75 or later**. Install the Rust toolchain via [rustup](https://rustup.rs/):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+After installation, reload your shell (or run `source ~/.cargo/env`) and confirm:
+
+```bash
+rustc --version   # e.g. rustc 1.78.0
+cargo --version   # e.g. cargo 1.78.0
+```
+
+You will also need the `wasm32-unknown-unknown` compilation target that Soroban contracts compile to:
+
+```bash
+rustup target add wasm32-unknown-unknown
+```
+
+### System libraries
+
+On Debian/Ubuntu-based Linux distributions, the `pkg-config` and `libssl-dev` packages are required to compile Sanctifier's TLS dependencies:
+
+```bash
+sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+```
+
+On macOS, the Xcode command-line tools provide the necessary libraries:
+
+```bash
+xcode-select --install
+```
+
+## Installation
+
+<Tabs>
+  <Tab title="Cargo (from source)">
+    Clone the Sanctifier repository and install the CLI with Cargo:
+
+    ```bash
+    git clone https://github.com/Centurylong/sanctifier.git
+    cd sanctifier
+    cargo install --path tooling/sanctifier-cli
+    ```
+
+    Cargo builds the `sanctifier` binary in release mode and copies it to `~/.cargo/bin`. This directory must be on your `PATH`:
+
+    ```bash
+    # Add to ~/.bashrc, ~/.zshrc, or the equivalent for your shell
+    echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
+    source ~/.bashrc
+    ```
+
+    Verify the installation:
+
+    ```bash
+    sanctifier --help
+    ```
+
+    You should see the top-level help output listing all available subcommands (`analyze`, `verify`, `prove`, `baseline`, `diff`, `attest`, `cve`, and more).
+
+    <Note>
+      The `sanctifier-cli` crate links against the `z3` crate (Z3 solver bindings) via the `smt` feature on `sanctifier-core`. On some platforms the `z3` crate compiles Z3 from source as part of `cargo build`, which can take several minutes on first install. Subsequent builds use the cached artifacts.
+    </Note>
+
+    **Updating**
+
+    After the initial install, you can update to the latest binary without re-cloning:
+
+    ```bash
+    # Pull the latest source
+    git -C sanctifier pull
+
+    # Reinstall
+    cargo install --path sanctifier/tooling/sanctifier-cli --force
+    ```
+
+    Or use the built-in updater command:
+
+    ```bash
+    sanctifier update
+    ```
+  </Tab>
+
+  <Tab title="Docker">
+    A Docker image is provided for teams that prefer a containerized workflow or need a reproducible CI environment without installing Rust.
+
+    **Build the image locally**
+
+    The `Dockerfile` in the repository root uses a two-stage build: a `rust:1.75-slim` builder stage compiles the binary, and a `debian:bookworm-slim` runtime stage runs it:
+
+    ```bash
+    git clone https://github.com/Centurylong/sanctifier.git
+    cd sanctifier
+    docker build -t sanctifier:latest .
+    ```
+
+    **Run a scan**
+
+    Mount your Soroban project as `/workspace` and pass `analyze` as the command:
+
+    ```bash
+    docker run --rm \
+      -v "$(pwd):/workspace" \
+      sanctifier:latest \
+      analyze .
+    ```
+
+    The container's `ENTRYPOINT` is the `sanctifier` binary and its default `CMD` is `--help`, so you can run any subcommand:
+
+    ```bash
+    # Initialize a project config
+    docker run --rm -v "$(pwd):/workspace" sanctifier:latest init
+
+    # Output findings as JSON for CI
+    docker run --rm -v "$(pwd):/workspace" sanctifier:latest analyze . --format json
+    ```
+
+    <Tip>
+      For CI pipelines, pin the Docker image to a specific Git SHA or tag to guarantee reproducible results across runs.
+    </Tip>
+  </Tab>
+</Tabs>
+
+## Optional: Formal verification dependencies
+
+The `sanctifier analyze` command and all static analysis features work with no additional dependencies. The following tools are only required if you intend to use `sanctifier prove` (SMT-based formal verification) or `sanctifier verify` (Kani model-checking).
+
+### Z3 SMT solver
+
+`sanctifier prove` uses Z3 under the hood to discharge token-invariant proofs. The `z3` Rust crate used by Sanctifier can either compile Z3 from source (automatic, no extra steps) or link against a system-installed Z3 library.
+
+To install a system Z3 library and avoid the longer build-from-source path:
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install -y z3 libz3-dev
+
+# macOS (Homebrew)
+brew install z3
+```
+
+Confirm Z3 is available:
+
+```bash
+z3 --version   # e.g. Z3 version 4.12.x
+```
+
+### Kani verifier
+
+`sanctifier verify` validates `#[sanctify::invariant]` declarations across a contract or workspace using the [Kani](https://model-checking.github.io/kani/) verifier. Kani runs as a separate subprocess, so it must be installed independently:
+
+```bash
+cargo install --locked kani-verifier
+cargo kani setup
+```
+
+Confirm Kani is available:
+
+```bash
+cargo kani --version
+```
+
+<Warning>
+  Kani requires a nightly Rust toolchain and is only supported on Linux and macOS x86-64. See the [Kani documentation](https://model-checking.github.io/kani/install-guide.html) for the full compatibility matrix before attempting installation on other platforms.
+</Warning>
+
+## Environment variables
+
+For teams using `sanctifier deploy` or the runtime-guard deployment scripts, a handful of environment variables control network and deployment behavior. Copy the provided template to a local file that is excluded from version control:
+
+```bash
+cp .env.example .env.local
+```
+
+The most important variables are:
+
+```bash
+# Required for deployment commands
+SOROBAN_SECRET_KEY=SBXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+# Network target (testnet | futurenet | mainnet)
+SOROBAN_NETWORK=testnet
+SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
+
+# Deployment behaviour
+VALIDATE_AFTER_DEPLOY=true
+CONTINUOUS_VALIDATION=true
+VALIDATION_INTERVAL=300
+```
+
+Load the file before running any deployment command:
+
+```bash
+source .env.local
+```
+
+<Warning>
+  Never commit `.env.local` to version control. It contains your `SOROBAN_SECRET_KEY`. Add it to `.gitignore` immediately after creating it.
+</Warning>
+
+## Verify the installation
+
+Run the following to confirm everything is working:
+
+```bash
+# Print the version
+sanctifier --version
+
+# Print all available commands
+sanctifier --help
+```
+
+A successful install prints the Sanctifier banner and the command list. If you see `command not found: sanctifier`, confirm that `~/.cargo/bin` is on your `PATH` (see the Cargo tab above).
+
+## Next steps
+
+Now that Sanctifier is installed, move on to the [Quickstart](/quickstart) to run your first scan, or jump straight to the [Configuration guide](/guides/configuration) to customize `.sanctify.toml` for your project.

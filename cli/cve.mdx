@@ -1,0 +1,272 @@
+---
+title: "sanctifier cve — Search and Export the Vulnerability Database"
+sidebarTitle: "cve"
+description: "Search, filter, display, export, and serve the built-in Soroban/Stellar CVE database from the command line or as a local HTTP API."
+---
+
+`sanctifier cve` is a subcommand group for interacting with the built-in Soroban and Stellar vulnerability database that powers `sanctifier analyze`. The database contains entries for known vulnerability classes (prefixed `SOL-` for Soroban/Stellar and `SOB-` for protocol-level issues), each with a severity rating, CVSS score, category, description, proof-of-concept snippet, patch guidance, and references. The five subcommands let you search, browse, display, export, and serve the database.
+
+## Subcommand overview
+
+| Subcommand | Description |
+|---|---|
+| `cve search` | Full-text search across ID, name, description, tags, and category |
+| `cve list` | List all entries with optional category and severity filters |
+| `cve show` | Display full details for a single entry by ID |
+| `cve export` | Dump the database as JSON or RSS to a file or stdout |
+| `cve serve` | Start a local HTTP API server on port 7654 |
+
+---
+
+## cve search
+
+Search the database for entries matching a keyword. The search checks the entry's ID, name, description, tags, and category fields.
+
+**Usage:**
+
+```bash
+sanctifier cve search --keyword <KEYWORD> [--format text|json]
+```
+
+<ParamField query="--keyword" type="string" required>
+  Keyword to search. Case-insensitive; matches any of: ID, name, description,
+  tags, category.
+</ParamField>
+
+<ParamField query="--format" type="text | json" default="text">
+  Output format. Use `json` to receive a JSON array of matching entries.
+</ParamField>
+
+**Examples:**
+
+```bash
+# Find all entries related to authorization
+sanctifier cve search --keyword "auth"
+
+# Search for reentrancy-related entries in JSON
+sanctifier cve search --keyword reentrancy --format json
+```
+
+**Sample text output:**
+
+```
+● 2 vulnerabilities matched 'auth':
+
+  SOL-2024-001 CRITICAL  [access-control CVSS 9.1]  Missing require_auth in privileged entrypoint
+  SOL-2024-007 HIGH      [access-control CVSS 7.8]  Confused-deputy authorization bypass
+```
+
+---
+
+## cve list
+
+List all vulnerability entries in the database with optional category or severity filters.
+
+**Usage:**
+
+```bash
+sanctifier cve list [-c CATEGORY] [-s SEVERITY] [--format text|json]
+```
+
+<ParamField query="--category" type="string">
+  Filter by category. Common values include `access-control`, `arithmetic`,
+  `storage`, `upgrade`, `events`. The match is case-insensitive.
+</ParamField>
+
+<ParamField query="--severity" type="string">
+  Filter by severity: `critical`, `high`, `medium`, or `low`.
+  Case-insensitive.
+</ParamField>
+
+<ParamField query="--format" type="text | json" default="text">
+  Output format.
+</ParamField>
+
+**Examples:**
+
+```bash
+# List all critical vulnerabilities
+sanctifier cve list --severity critical
+
+# List all access-control entries
+sanctifier cve list --category access-control
+
+# List high-severity arithmetic entries as JSON
+sanctifier cve list --category arithmetic --severity high --format json
+```
+
+**Sample output:**
+
+```
+● 3 entries [category: arithmetic]
+
+  SOL-2024-003 HIGH    [arithmetic CVSS 8.0]  Unchecked integer overflow in token arithmetic
+  SOB-2024-015 MEDIUM  [arithmetic CVSS 5.9]  Saturating arithmetic misuse in balance cap logic
+  SOL-2024-018 LOW     [arithmetic CVSS 3.2]  Integer truncation in fee calculation
+```
+
+---
+
+## cve show
+
+Display the full details for a specific vulnerability entry by its ID.
+
+**Usage:**
+
+```bash
+sanctifier cve show <ID> [--format text|json]
+```
+
+<ParamField path="ID" type="string" required>
+  Vulnerability ID. Accepts `SOL-YYYY-NNN` (Soroban/Stellar layer) or
+  `SOB-YYYY-NNN` (protocol layer) format.
+</ParamField>
+
+<ParamField query="--format" type="text | json" default="text">
+  Output format. Use `json` to receive the full entry as a JSON object.
+</ParamField>
+
+**Examples:**
+
+```bash
+sanctifier cve show SOL-2024-001
+sanctifier cve show SOB-2024-015 --format json
+```
+
+**Sample text output:**
+
+```
+────────────────────────────────────────────────────────────
+SOL-2024-001 — Missing require_auth in privileged entrypoint
+────────────────────────────────────────────────────────────
+Severity : CRITICAL  (CVSS 9.1)
+Category : access-control
+Affects  : soroban-sdk <0.9.0
+
+State-mutating functions that do not call require_auth() allow any
+caller to invoke privileged operations (mint, burn, upgrade) without
+holding the necessary authority.
+
+PoC:
+  pub fn mint(env: Env, to: Address, amount: i128) {
+      // No require_auth — any caller can mint tokens
+      let balance: i128 = env.storage()...get(...).unwrap_or(0);
+      env.storage()...set(..., balance + amount);
+  }
+
+Patch:
+  pub fn mint(env: Env, to: Address, amount: i128) {
+      env.current_contract_address().require_auth();
+      ...
+  }
+
+Recommendation:
+  Add require_auth() or require_auth_for_args() at the top of every
+  state-mutating entrypoint.
+
+Tags: auth, missing-auth, privilege-escalation
+
+References:
+  • https://docs.stellar.org/docs/smart-contracts/example-contracts/auth
+────────────────────────────────────────────────────────────
+```
+
+---
+
+## cve export
+
+Export the full vulnerability database to a file or stdout in JSON or RSS format.
+
+**Usage:**
+
+```bash
+sanctifier cve export [--format json|rss] [-o FILE] [--base-url URL]
+```
+
+<ParamField query="--format" type="json | rss" default="json">
+  Export format. Use `json` for machine consumption or to use as a custom
+  `--vuln-db` with `sanctifier analyze`. Use `rss` to generate a feed that
+  security teams can subscribe to.
+</ParamField>
+
+<ParamField query="--output" type="string">
+  Write the output to this file path. When omitted, the content is printed to
+  stdout.
+</ParamField>
+
+<ParamField query="--base-url" type="string" default="https://sanctifier.dev">
+  Base URL used to generate entry links in the RSS feed. Override this when
+  self-hosting the database.
+</ParamField>
+
+**Examples:**
+
+```bash
+# Export as JSON to a file
+sanctifier cve export --format json --output vulndb.json
+
+# Export as RSS for a security feed
+sanctifier cve export --format rss --output feed.rss --base-url https://security.myorg.com
+
+# Pipe JSON to jq
+sanctifier cve export | jq '[.[] | select(.severity == "critical")]'
+```
+
+The RSS export produces a standard `<channel>` with one `<item>` per entry, including title, description, severity, category, link, and publication date.
+
+**Using a custom database with sanctifier analyze:**
+
+Export the built-in database, extend it with your own entries, and pass it back:
+
+```bash
+sanctifier cve export --format json --output my-vulndb.json
+# ... edit my-vulndb.json to add proprietary entries ...
+sanctifier analyze . --vuln-db my-vulndb.json
+```
+
+---
+
+## cve serve
+
+Start a local HTTP server that exposes the vulnerability database as a JSON API and RSS feed.
+
+**Usage:**
+
+```bash
+sanctifier cve serve [--port PORT]
+```
+
+<ParamField query="--port" type="number" default="7654">
+  TCP port to listen on.
+</ParamField>
+
+**Example:**
+
+```bash
+sanctifier cve serve
+```
+
+```
+✓ Sanctifier CVE database listening on http://127.0.0.1:7654
+  GET /api/vulndb          → full JSON database
+  GET /api/vulndb/<id>     → single entry JSON
+  GET /api/vulndb/feed.rss → RSS feed
+
+Press Ctrl-C to stop.
+```
+
+**Available endpoints:**
+
+| Endpoint | Response |
+|---|---|
+| `GET /api/vulndb` | Full database as a JSON array |
+| `GET /api/vulndb/<ID>` | Single entry JSON (e.g. `/api/vulndb/SOL-2024-001`) |
+| `GET /api/vulndb/feed.rss` | RSS feed of all entries |
+
+All responses include `Access-Control-Allow-Origin: *`, making the API usable from browser-based tooling without CORS configuration.
+
+<Tip>
+  Run `sanctifier cve serve` during development to explore the vulnerability
+  database from a browser or integrate it with an IDE extension that can query
+  local HTTP APIs.
+</Tip>

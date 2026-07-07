@@ -1,0 +1,252 @@
+---
+title: "Runtime Invariant Guards for Soroban Contracts"
+sidebarTitle: "Runtime Guards"
+description: "Use the sanctifier_guards crate and guard_invariant! macro to publish on-chain audit events and trap transactions when invariants are violated at runtime."
+---
+
+Static analysis and formal verification check your contract before deployment; runtime guards check it *during* every live transaction. The `sanctifier_guards` crate provides a zero-dependency `#[no_std]` macro library that lets you express invariants inline in your contract code. When an invariant fails, the macro publishes a structured event to the on-chain ledger and then traps the transaction — giving you a permanent, indexer-queryable audit trail that survives the state rollback.
+
+## The `guard_invariant!` Macro
+
+The core primitive exported by `sanctifier_guards` is the `guard_invariant!` macro:
+
+```rust
+guard_invariant!(env, cond, Error::X)
+```
+
+| Argument | Type | Description |
+|---|---|---|
+| `env` | `&Env` or `Env` | The Soroban environment handle (evaluated once). |
+| `cond` | any `bool` expression | The invariant to assert (evaluated exactly once). |
+| `Error::X` | any `IntoVal<Env, Error>` | The typed contract error to surface on violation. |
+
+### What Happens Step by Step
+
+<Steps>
+  <Step title="Evaluate condition once">
+    The expression passed as `cond` is bound to a local `bool` variable immediately. This guarantees the condition is evaluated **exactly once**, regardless of side effects. Soroban storage reads cost gas — silent double-evaluation would both miscount and overcharge:
+
+    ```rust
+    // Inside the macro expansion:
+    let __sanctifier_guards_cond: bool = $cond;
+    ```
+  </Step>
+  <Step title="Publish the audit event">
+    If the condition is `false`, the macro publishes an `inv_fail` event **before** trapping. The event carries the condition source text as its data payload so off-chain indexers can identify which invariant fired without decoding contract state:
+
+    ```rust
+    __sanctifier_guards_env.events().publish(
+        (soroban_sdk::symbol_short!("inv_fail"),),
+        (
+            soroban_sdk::symbol_short!("cond"),
+            soroban_sdk::String::from_str(
+                __sanctifier_guards_env,
+                ::core::stringify!($cond),
+            ),
+        ),
+    );
+    ```
+  </Step>
+  <Step title="Trap via panic_with_error!">
+    After publishing the event, the macro calls `panic_with_error!(env, err)`. This surfaces the typed `Error` value to the Stellar host and rolls back all contract state changes. Crucially, the on-chain event published in the previous step is **not** rolled back — Soroban commits events before the trap, so the audit trail persists on the ledger.
+  </Step>
+</Steps>
+
+<Note>
+  The event is published before the trap intentionally. Soroban's host commits
+  the transaction's event set even when the contract traps, so every invariant
+  violation leaves a permanent, indexer-queryable record on the ledger regardless
+  of whether the surrounding state changes roll back.
+</Note>
+
+---
+
+## Topic Constants
+
+`sanctifier_guards` exports two public constants used as event topics:
+
+```rust
+/// Topic used by every `guard_invariant!` failure event.
+/// Eight bytes — fits inside the nine-byte `symbol_short!` budget.
+pub const INVARIANT_FAILURE_TOPIC: &str = "inv_fail";
+
+/// Topic used when a guarded post-condition succeeds (optional monitoring).
+pub const INVARIANT_PASS_TOPIC: &str = "inv_pass";
+```
+
+Re-exporting these constants means your test code and off-chain indexers can subscribe to invariant events without embedding stringly-typed literals that could silently drift.
+
+---
+
+## Adding the Crate Dependency
+
+In your contract's `Cargo.toml`:
+
+```toml
+[dependencies]
+sanctifier-guards = { path = "../../tooling/sanctifier-guards" }
+soroban-sdk = "20.5.0"
+```
+
+The crate is `#![no_std]`, so it links into any Soroban WASM target without pulling in the standard library.
+
+---
+
+## Complete Integration Example
+
+The following example is drawn from the runtime-guards integration guide and shows how to wire `guard_invariant!` into a real vault contract that protects its deposit and withdraw entrypoints.
+
+### Step 1 — Define your error type
+
+```rust
+use soroban_sdk::contracterror;
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum VaultError {
+    NegativeBalance    = 1,
+    InsolventShares    = 2,
+}
+```
+
+### Step 2 — Import and use guard_invariant!
+
+```rust
+use sanctifier_guards::guard_invariant;
+use soroban_sdk::{contract, contractimpl, symbol_short, Env};
+
+#[contract]
+pub struct VaultContract;
+
+#[contractimpl]
+impl VaultContract {
+    pub fn deposit(env: Env, caller: soroban_sdk::Address, amount: i128) {
+        caller.require_auth();
+
+        let balance: i128 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("BAL"))
+            .unwrap_or(0);
+
+        let new_balance = balance + amount;
+
+        // Runtime invariant: balances must never go negative after deposit
+        guard_invariant!(&env, new_balance >= 0, VaultError::NegativeBalance);
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("BAL"), &new_balance);
+    }
+
+    pub fn withdraw(env: Env, caller: soroban_sdk::Address, amount: i128) {
+        caller.require_auth();
+
+        let balance: i128 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("BAL"))
+            .unwrap_or(0);
+
+        // Runtime invariant: sender must have sufficient funds
+        guard_invariant!(&env, balance >= amount, VaultError::NegativeBalance);
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("BAL"), &(balance - amount));
+    }
+}
+```
+
+### Step 3 — Pattern for pre/post state checks
+
+For more comprehensive invariant enforcement, wrap mutating logic in a helper that checks state both before and after the operation:
+
+```rust
+use sanctifier_core::{Error as SanctifierError, SanctifiedGuard};
+use soroban_sdk::{Address, Env, Symbol};
+
+pub struct VaultRuntimeGuard {
+    pub total_shares: i128,
+    pub assets_under_management: i128,
+}
+
+impl SanctifiedGuard for VaultRuntimeGuard {
+    fn check_invariant(&self, _env: &Env) -> Result<(), SanctifierError> {
+        if self.total_shares < 0 || self.assets_under_management < 0 {
+            return Err(SanctifierError::InvariantViolation(
+                "negative balances are not allowed".to_string(),
+            ));
+        }
+
+        if self.total_shares == 0 && self.assets_under_management != 0 {
+            return Err(SanctifierError::InvariantViolation(
+                "assets must be zero when total shares is zero".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+```
+
+---
+
+## The `inv_pass` Topic for Monitoring
+
+For contracts where you want to record *successful* guard checks alongside failures — useful for SLA monitoring dashboards — use the companion `guard_invariant_pass!` macro:
+
+```rust
+use sanctifier_guards::guard_invariant_pass;
+
+// Emits an "inv_pass" event with the condition source text in the data payload.
+// Does NOT trap, even when called with a condition that is always true.
+guard_invariant_pass!(&env, new_balance >= 0);
+```
+
+Off-chain indexers can subscribe to both `inv_fail` and `inv_pass` topics on the same contract address to build a continuous invariant-health time series.
+
+---
+
+## Result-Returning Variant
+
+The trapping form of `guard_invariant!` goes through `panic_with_error!`, which in the soroban-sdk testutils raises a non-unwinding panic that aborts the test runner before `#[should_panic]` or `std::panic::catch_unwind` can rescue it. For unit tests, use the Result-returning variant instead:
+
+```rust
+use sanctifier_guards::guard_invariant_result;
+
+pub fn check_eq_result(env: Env, a: u32, b: u32) -> Result<(), soroban_sdk::Error> {
+    // Returns Err(VaultError::BadState.into()) on violation instead of trapping.
+    // Publishes the same inv_fail event as guard_invariant!.
+    guard_invariant_result!(&env, a == b, VaultError::BadState);
+    Ok(())
+}
+```
+
+The event-publishing and condition-evaluation semantics are identical to `guard_invariant!`. Only the exit mechanism differs: `Err` return instead of `panic_with_error!`.
+
+---
+
+## Recommended Invariant Checklist
+
+<CardGroup cols={2}>
+  <Card title="Balance / Supply" icon="scale-balanced">
+    No negative balances or shares. Total supply equals the sum of all holder balances where applicable.
+  </Card>
+  <Card title="Ownership" icon="key">
+    Admin and owner addresses are initialized and non-zero before any privileged operation proceeds.
+  </Card>
+  <Card title="Bounded Values" icon="gauge">
+    Fee rates, utilization ratios, and cap values stay within their allowed ranges at all times.
+  </Card>
+  <Card title="State Consistency" icon="diagram-project">
+    When `total_shares == 0`, `assets_under_management` must also equal zero, and vice versa.
+  </Card>
+</CardGroup>
+
+<Tip>
+  Pair runtime guards with static analysis and formal proofs for defence in
+  depth: `sanctifier analyze` catches structural issues at scan time, Kani
+  harnesses prove pure-function properties exhaustively, and `guard_invariant!`
+  traps any violation that slips through at execution time.
+</Tip>

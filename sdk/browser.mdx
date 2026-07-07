@@ -1,0 +1,407 @@
+---
+title: "Use @sanctifier/sdk in Browser Applications"
+sidebarTitle: "Browser"
+description: "Analyze Stellar Soroban contracts in the browser with @sanctifier/sdk — fetch the WASM bundle once with init(), then call analyze() from any JS context."
+---
+
+`@sanctifier/sdk` ships a dedicated browser build that loads the Sanctifier WASM
+binary via the browser's native `fetch`-based WebAssembly instantiation API rather
+than Node's synchronous `require`. The public API — types, function signatures, error
+classes — is identical to the Node.js entry, so code that calls `analyze()` is
+fully portable between runtimes.
+
+## Import path
+
+```typescript
+// Explicit browser sub-path — always resolves to the browser build.
+import { analyze, init, findingCodes, coreVersion, SanctifierError } from "@sanctifier/sdk/browser";
+```
+
+If your bundler is configured with a `browser` target condition (Vite, webpack with
+`target: "web"`, Rollup with `browser: true`), importing from the package root
+`"@sanctifier/sdk"` resolves to the browser build automatically via the `exports`
+map in `package.json`.
+
+```typescript
+// Also resolves to the browser build when the bundler sets the "browser" condition.
+import { analyze, init } from "@sanctifier/sdk";
+```
+
+<Tip>
+  When writing a library that must run in both Node and browsers, use the package
+  root import and let the bundler or runtime select the correct entry. Call
+  `await init()` unconditionally — it is a no-op in Node and performs WASM loading
+  in browsers.
+</Tip>
+
+## How the browser entry differs from Node
+
+| | Node entry | Browser entry |
+|---|---|---|
+| WASM loading | `require()` at module init time (synchronous) | `fetch` + `WebAssembly.instantiateStreaming` (async) |
+| `init()` | No-op, returns immediately | **Must be called before `analyze()`** |
+| `analyzeSync` | Exported | Not available |
+| `analyze()` | Available | Available |
+| `findingCodes()` | Available | Available (after `init()`) |
+| `coreVersion()` | Available | Available (after `init()`) |
+
+## Initialising the WASM module
+
+The browser entry guards every API function behind an `assertInitialized()` check.
+Calling `analyze()` before `init()` throws:
+
+```
+Error: Sanctifier WASM is not initialized. Call `await init()` first
+or pass the wasm URL/bytes to init().
+```
+
+Call `init()` once, as early as possible in your application bootstrap.
+Subsequent calls are cheap — the module caches the `initialized` flag and returns
+immediately.
+
+```typescript
+import { init, analyze } from "@sanctifier/sdk/browser";
+
+// Call once during app startup.
+await init();
+
+// All subsequent analyze() calls are ready immediately.
+const report = await analyze(sourceCode);
+```
+
+### Passing a WASM URL explicitly
+
+By default, `init()` resolves the WASM binary at the URL adjacent to the JS glue
+file. Most bundlers handle this automatically. If yours does not, pass the URL or
+binary explicitly:
+
+```typescript
+// Vite: import the WASM URL as an asset reference.
+import wasmUrl from "@sanctifier/sdk/wasm/web/sanctifier_bg.wasm?url";
+import { init, analyze } from "@sanctifier/sdk/browser";
+
+await init(wasmUrl);
+```
+
+```typescript
+// Manual fetch: pass a Response or BufferSource.
+import { init, analyze } from "@sanctifier/sdk/browser";
+
+const response = await fetch("/assets/sanctifier_bg.wasm");
+await init(response);
+```
+
+The `InitInput` type accepted by `init()` matches the first parameter of the
+wasm-bindgen-generated initializer:
+
+```typescript
+export type InitInput =
+  | RequestInfo    // string URL or Request
+  | URL
+  | Response
+  | BufferSource   // ArrayBuffer, TypedArray, etc.
+  | WebAssembly.Module;
+```
+
+## Bundler setup
+
+<Tabs>
+  <Tab title="Vite">
+    Vite handles WASM files automatically when you import them with `?url`. No
+    additional plugin is required for `@sanctifier/sdk`.
+
+    ```typescript
+    // vite.config.ts — no special WASM configuration needed for default usage.
+    import { defineConfig } from "vite";
+
+    export default defineConfig({
+      // The browser condition is set automatically for web builds.
+    });
+    ```
+
+    If you import the WASM URL explicitly, Vite copies the binary to the output
+    directory and replaces the import with the hashed asset URL at build time.
+
+    ```typescript
+    import wasmUrl from "@sanctifier/sdk/wasm/web/sanctifier_bg.wasm?url";
+    import { init } from "@sanctifier/sdk/browser";
+
+    await init(wasmUrl);
+    ```
+  </Tab>
+  <Tab title="webpack 5">
+    webpack 5 supports WebAssembly natively. Enable the experimental async modules
+    feature to allow top-level `await` in entrypoints:
+
+    ```javascript
+    // webpack.config.js
+    module.exports = {
+      experiments: {
+        asyncWebAssembly: true,
+        topLevelAwait: true,
+      },
+    };
+    ```
+
+    Import and initialise normally — webpack resolves the `.wasm` file and emits
+    it as a chunk.
+
+    ```typescript
+    import { init, analyze } from "@sanctifier/sdk/browser";
+    await init();
+    ```
+  </Tab>
+  <Tab title="No bundler (ESM CDN)">
+    In a plain HTML page with ES module `<script type="module">`, import from a
+    CDN that supports package exports (e.g. esm.sh) and pass the WASM URL
+    explicitly because there is no bundler to resolve the adjacent binary.
+
+    ```html
+    <script type="module">
+      import { init, analyze } from "https://esm.sh/@sanctifier/sdk/browser";
+
+      await init("https://esm.sh/@sanctifier/sdk/wasm/web/sanctifier_bg.wasm");
+
+      const report = await analyze(document.getElementById("source").value);
+      console.log(report.findings);
+    </script>
+    ```
+  </Tab>
+</Tabs>
+
+## Complete browser example (vanilla JS)
+
+```html
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Sanctifier Playground</title>
+  </head>
+  <body>
+    <textarea id="source" rows="20" cols="80" placeholder="Paste Soroban Rust source here…"></textarea>
+    <br />
+    <button id="analyze-btn">Analyze</button>
+    <pre id="output"></pre>
+
+    <script type="module">
+      import { init, analyze, SanctifierError } from "@sanctifier/sdk/browser";
+
+      // Initialize once when the page loads.
+      await init();
+
+      document.getElementById("analyze-btn").addEventListener("click", async () => {
+        const source = document.getElementById("source").value;
+        const output = document.getElementById("output");
+
+        try {
+          const report = await analyze(source, { failOn: "high" });
+
+          const lines = [
+            `${report.summary.total} finding(s) — ` +
+              `critical: ${report.summary.critical}, ` +
+              `high: ${report.summary.high}, ` +
+              `medium: ${report.summary.medium}, ` +
+              `low: ${report.summary.low}, ` +
+              `info: ${report.summary.info}`,
+            "",
+          ];
+
+          for (const f of report.findings) {
+            const line = f.line != null ? `:${f.line}` : "";
+            lines.push(`[${f.severity.toUpperCase()}] ${f.code}  ${f.location}${line}`);
+            lines.push(`  ${f.message}`);
+          }
+
+          output.textContent = lines.join("\n");
+        } catch (err) {
+          if (err instanceof SanctifierError) {
+            output.textContent =
+              `Threshold breached ('${err.threshold}'): ` +
+              `${err.report.summary.total} finding(s)\n\n${err.message}`;
+          } else {
+            output.textContent = String(err);
+          }
+        }
+      });
+    </script>
+  </body>
+</html>
+```
+
+## Complete browser example (React)
+
+```typescript
+import { useEffect, useState, useRef } from "react";
+import { init, analyze, SanctifierError } from "@sanctifier/sdk/browser";
+import type { AnalysisReport } from "@sanctifier/sdk/browser";
+
+export function SanctifierPlayground() {
+  const [source, setSource] = useState("");
+  const [report, setReport] = useState<AnalysisReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [ready, setReady] = useState(false);
+
+  // Initialize WASM once on mount.
+  useEffect(() => {
+    init().then(() => setReady(true));
+  }, []);
+
+  async function handleAnalyze() {
+    setError(null);
+    setReport(null);
+
+    try {
+      const result = await analyze(source, { failOn: "high" });
+      setReport(result);
+    } catch (err) {
+      if (err instanceof SanctifierError) {
+        setError(
+          `${err.report.summary.total} finding(s) at or above '${err.threshold}'. ` +
+          err.message
+        );
+        // The full report is still available via err.report.
+        setReport(err.report);
+      } else {
+        setError(String(err));
+      }
+    }
+  }
+
+  return (
+    <div>
+      <textarea
+        rows={20}
+        cols={80}
+        value={source}
+        onChange={(e) => setSource(e.target.value)}
+        placeholder="Paste Soroban Rust source here…"
+      />
+      <br />
+      <button onClick={handleAnalyze} disabled={!ready}>
+        {ready ? "Analyze" : "Loading WASM…"}
+      </button>
+
+      {error && <p style={{ color: "red" }}>{error}</p>}
+
+      {report && (
+        <ul>
+          {report.findings.map((f, i) => (
+            <li key={i}>
+              <strong>[{f.severity.toUpperCase()}] {f.code}</strong>{" "}
+              {f.location}{f.line != null ? `:${f.line}` : ""} — {f.message}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+```
+
+<Info>
+  The `disabled={!ready}` guard prevents the button from being clickable before
+  `init()` resolves. Calling `analyze()` before `init()` throws synchronously
+  with the message shown above, so it is important to wait for the Promise.
+</Info>
+
+## Handling async initialisation
+
+`init()` is idempotent and caches its promise internally. Calling it multiple
+times is safe — only the first call performs the fetch and instantiation.
+
+```typescript
+import { init, analyze } from "@sanctifier/sdk/browser";
+
+// Safe to call from multiple places; only the first invocation does real work.
+await init();
+await init(); // no-op
+await init(); // no-op
+
+const report = await analyze(source);
+```
+
+If you need to delay rendering until the WASM is ready, gate on the `init()`
+promise in your app's bootstrap before mounting the UI:
+
+```typescript
+// main.ts — Vite / plain ESM entrypoint
+import { init } from "@sanctifier/sdk/browser";
+import { mountApp } from "./app.js";
+
+await init();
+mountApp(document.getElementById("root")!);
+```
+
+## `SanctifierError` in the browser
+
+The browser entry exports `SanctifierError` with the same shape as the Node entry.
+Use `instanceof` to distinguish it from generic errors:
+
+```typescript
+import { analyze, SanctifierError } from "@sanctifier/sdk/browser";
+import type { Severity } from "@sanctifier/sdk/browser";
+
+async function runAudit(source: string, gate: Severity) {
+  try {
+    const report = await analyze(source, { failOn: gate });
+    return { ok: true, report } as const;
+  } catch (err) {
+    if (err instanceof SanctifierError) {
+      // err.report is the full AnalysisReport — render it even on failure.
+      return { ok: false, report: err.report, threshold: err.threshold } as const;
+    }
+    throw err; // Re-throw unexpected errors (e.g. TypeError from bad input).
+  }
+}
+```
+
+<Warning>
+  `SanctifierError` carries `err.report` and `err.threshold` as readonly
+  properties. They are always present when `err instanceof SanctifierError`
+  is true — no nullability checks required.
+</Warning>
+
+## `failOn` behaviour
+
+`failOn` works identically in both the Node and browser entries. When set, the
+WASM analysis runs to completion, the full `AnalysisReport` is built, and then the
+SDK checks whether any finding's severity meets or exceeds the threshold. If it
+does, the promise rejects with a `SanctifierError` that contains the complete report.
+
+```typescript
+import { init, analyze, SanctifierError } from "@sanctifier/sdk/browser";
+
+await init();
+
+// Gate on "medium": rejects if any finding is medium, high, or critical.
+try {
+  const report = await analyze(source, { failOn: "medium" });
+  console.log("No medium+ findings.");
+} catch (err) {
+  if (err instanceof SanctifierError) {
+    console.warn(`Found ${err.report.summary.total} issue(s).`);
+    // Access lower-severity findings too — they are in err.report.findings.
+    const infoCount = err.report.findings.filter((f) => f.severity === "info").length;
+    console.log(`(${infoCount} of those are informational only)`);
+  }
+}
+```
+
+## API parity with Node.js
+
+Every exported name, type, and interface is identical between the browser and Node
+entries. The only differences are:
+
+1. `init()` is a real async operation in the browser; it is a no-op in Node.
+2. `analyzeSync` is not exported from the browser entry.
+3. The browser `init()` accepts an `InitInput` argument (URL, `Response`,
+   `BufferSource`, or `WebAssembly.Module`); the Node no-op ignores any argument.
+
+All types — `AnalysisReport`, `Finding`, `AnalyzeOptions`, `SeveritySummary`,
+`RawReport`, `CustomRule`, `SanctifierError`, and all others — are imported from
+the same shared `types.ts` source and compiled into a single `dist/types/index.d.ts`
+declaration file referenced by both sub-path exports.
+
+See the [SDK overview](/sdk/overview) for full type documentation and the
+[Node.js guide](/sdk/node) for server-side usage patterns.
